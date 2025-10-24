@@ -7,7 +7,16 @@ from torch import nn
 from pydantic import BaseModel
 
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.layers import (
+    SwiGLU,
+    Attention,
+    RotaryEmbedding,
+    CosSin,
+    CastedEmbedding,
+    CastedLinear,
+    make_inbound_scalenorm,
+    make_outbound_scalenorm,
+)
 from models.sparse_embedding import CastedSparseEmbedding
 
 @dataclass
@@ -45,7 +54,6 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
     num_heads: int
     pos_encodings: str
 
-    rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     
     # Halting Q-learning config
@@ -68,6 +76,9 @@ class HierarchicalReasoningModel_ACTV1Block(nn.Module):
                 hidden_size=self.config.seq_len + self.puzzle_emb_len, # L
                 expansion=config.expansion,
             )
+            mlp_t_dim = self.config.seq_len + self.puzzle_emb_len
+            self.mlp_t_in_norm = make_inbound_scalenorm(mlp_t_dim)
+            self.mlp_t_out_norm = make_outbound_scalenorm(mlp_t_dim)
         else:
             self.self_attn = Attention(
                 hidden_size=config.hidden_size,
@@ -76,26 +87,36 @@ class HierarchicalReasoningModel_ACTV1Block(nn.Module):
                 num_key_value_heads=config.num_heads,
                 causal=False
             )
+            self.self_attn_in_norm = make_inbound_scalenorm(config.hidden_size)
+            self.self_attn_out_norm = make_outbound_scalenorm(config.hidden_size)
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
         )
-        self.norm_eps = config.rms_norm_eps
+        self.mlp_in_norm = make_inbound_scalenorm(config.hidden_size)
+        self.mlp_out_norm = make_outbound_scalenorm(config.hidden_size)
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         # B, L, D = hidden_states.shape
         # Post Norm
         if self.config.mlp_t:
             hidden_states = hidden_states.transpose(1,2)
-            out = self.mlp_t(hidden_states)
-            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+            residual = hidden_states
+            branch = self.mlp_t_out_norm(self.mlp_t(self.mlp_t_in_norm(hidden_states)))
+            hidden_states = residual + branch
             hidden_states = hidden_states.transpose(1,2)
         else:
             # Self Attention
-            hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+            residual = hidden_states
+            branch = self.self_attn(
+                cos_sin=cos_sin,
+                hidden_states=self.self_attn_in_norm(hidden_states)
+            )
+            hidden_states = residual + self.self_attn_out_norm(branch)
         # Fully Connected
-        out = self.mlp(hidden_states)
-        hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+        residual = hidden_states
+        branch = self.mlp(self.mlp_in_norm(hidden_states))
+        hidden_states = residual + self.mlp_out_norm(branch)
         return hidden_states
 
 class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
@@ -103,10 +124,21 @@ class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
         super().__init__()
 
         self.layers = torch.nn.ModuleList(layers)
+        if len(layers) > 0:
+            hidden_size = layers[0].config.hidden_size
+            self.input_in_norm = make_inbound_scalenorm(hidden_size)
+            self.input_out_norm = make_outbound_scalenorm(hidden_size)
+        else:
+            self.input_in_norm = None
+            self.input_out_norm = None
 
     def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
         # Input injection (add)
-        hidden_states = hidden_states + input_injection
+        if input_injection is not None and self.input_in_norm is not None:
+            input_injection = self.input_out_norm(self.input_in_norm(input_injection))
+            hidden_states = hidden_states + input_injection
+        elif input_injection is not None:
+            hidden_states = hidden_states + input_injection
         # Layers
         for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states, **kwargs)
@@ -127,6 +159,10 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
         self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
+        self.embedding_in_norm = make_inbound_scalenorm(self.config.hidden_size)
+        self.embedding_out_norm = make_outbound_scalenorm(self.config.hidden_size)
+        self.output_in_norm = make_inbound_scalenorm(self.config.hidden_size)
+        self.output_out_norm = make_outbound_scalenorm(self.config.hidden_size)
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  # ceil div
         if self.config.puzzle_emb_ndim > 0:
@@ -177,8 +213,9 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             # scale by 1/sqrt(2) to maintain forward variance
             embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
 
-        # Scale
-        return self.embed_scale * embedding
+        # Scale + Normalize
+        embedding = self.embed_scale * embedding
+        return self.embedding_out_norm(self.embedding_in_norm(embedding))
 
     def empty_carry(self, batch_size: int):
         return HierarchicalReasoningModel_ACTV1InnerCarry(
@@ -215,13 +252,19 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         z_H = self.H_level(z_H, z_L, **seq_info)
 
         # LM Outputs
+        z_proj = self.output_out_norm(self.output_in_norm(z_H))
         new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+        output = self._cosine_logits(z_proj)[:, self.puzzle_emb_len:]
 
         # Q head
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
-        
+        q_logits = self.q_head(z_proj[:, 0]).to(torch.float32)
+
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+
+    def _cosine_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = F.normalize(hidden_states, dim=-1)
+        weight = F.normalize(self.lm_head.weight.to(hidden_states.dtype), dim=-1)
+        return self.embed_scale * F.linear(hidden_states, weight)
 
 
 class HierarchicalReasoningModel_ACTV1(nn.Module):

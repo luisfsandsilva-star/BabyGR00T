@@ -73,9 +73,29 @@ class CastedEmbedding(nn.Module):
         self.embedding_weight = nn.Parameter(
             trunc_normal_init_(torch.empty((num_embeddings, embedding_dim)), std=init_std)
         )
-        
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.embedding(input, self.embedding_weight.to(self.cast_to))
+
+
+class ScaleNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.g = nn.Parameter(torch.tensor(float(dim**0.5)))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        g = self.g.to(hidden_states.dtype)
+        norm = torch.linalg.norm(hidden_states, ord=2, dim=-1, keepdim=True)
+        return hidden_states * (g / (norm + self.eps))
+
+
+def make_inbound_scalenorm(dim: int, eps: float = 1e-6) -> ScaleNorm:
+    return ScaleNorm(dim=dim, eps=eps)
+
+
+def make_outbound_scalenorm(dim: int, eps: float = 1e-6) -> ScaleNorm:
+    return ScaleNorm(dim=dim, eps=eps)
 
 
 class RotaryEmbedding(nn.Module):
@@ -159,14 +179,6 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
-
-def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
-    input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
-
-    variance = hidden_states.square().mean(-1, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
-    return hidden_states.to(input_dtype)
 
 class CrossAttention(nn.Module):
     def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False):
