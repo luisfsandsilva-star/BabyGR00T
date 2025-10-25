@@ -123,6 +123,11 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         causal=False  # Non-autoregressive
     )
 
+    if train_metadata.input_dim is not None:
+        model_cfg["latent_dim"] = train_metadata.input_dim
+    if train_metadata.target_dim is not None:
+        model_cfg["output_dim"] = train_metadata.target_dim
+
     # Instantiate model with loss head
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)

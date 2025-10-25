@@ -303,7 +303,10 @@ def convert_dataset(config: DataProcessConfig):
             total_groups=total_groups,
             mean_puzzle_examples=total_examples / total_puzzles,
             total_puzzles=total_puzzles,
-            sets=list(split.keys())
+            sets=list(split.keys()),
+            task_type="classification",
+            input_pad_value=0,
+            target_pad_value=-100,
         )
 
         # Save metadata as JSON.
