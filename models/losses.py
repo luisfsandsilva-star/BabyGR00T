@@ -74,22 +74,29 @@ class ACTLossHead(nn.Module):
             valid_metrics = new_carry.halted & (loss_counts > 0)
             metrics = {
                 "count": valid_metrics.sum(),
-                
+
                 "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
-
-                "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
                 "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
+            if "q_halt_logits" in outputs:
+                metrics["q_halt_accuracy"] = (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum()
+            else:
+                metrics["q_halt_accuracy"] = torch.zeros((), dtype=torch.int64, device=valid_metrics.device)
 
         # Losses
 
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
-        q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
-        metrics.update({
-            "lm_loss": lm_loss.detach(),
-            "q_halt_loss": q_halt_loss.detach(),
-        })
+        metrics["lm_loss"] = lm_loss.detach()
+
+        q_halt_loss = torch.zeros((), dtype=lm_loss.dtype, device=lm_loss.device)
+        if "q_halt_logits" in outputs:
+            q_halt_loss = F.binary_cross_entropy_with_logits(
+                outputs["q_halt_logits"],
+                seq_is_correct.to(outputs["q_halt_logits"].dtype),
+                reduction="sum",
+            )
+        metrics["q_halt_loss"] = q_halt_loss.detach()
         # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
         q_continue_loss = 0
         if "target_q_continue" in outputs:
