@@ -75,6 +75,8 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
     use_cross_attn: bool = False
     keep_act_halting_head: bool = True
+    use_constant_cross_attn: bool = False
+    cross_attn_constant_dim: int = 0
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -162,14 +164,25 @@ class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
             self.input_in_norm = None
             self.input_out_norm = None
 
-    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_injection: torch.Tensor,
+        cross_attn_states: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
         if input_injection is not None and self.input_in_norm is not None:
             input_injection = self.input_out_norm(self.input_in_norm(input_injection))
             hidden_states = hidden_states + input_injection
         elif input_injection is not None:
             hidden_states = hidden_states + input_injection
+        encoder_states = cross_attn_states if cross_attn_states is not None else input_injection
         for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states, encoder_states=input_injection, **kwargs)
+            hidden_states = layer(
+                hidden_states=hidden_states,
+                encoder_states=encoder_states,
+                **kwargs,
+            )
         return hidden_states
 
 
@@ -195,6 +208,25 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.embedding_out_norm = make_outbound_scalenorm(self.config.hidden_size)
         self.output_in_norm = make_inbound_scalenorm(self.config.hidden_size)
         self.output_out_norm = make_outbound_scalenorm(self.config.hidden_size)
+
+        if (
+            getattr(self.config, "use_cross_attn", False)
+            and getattr(self.config, "use_constant_cross_attn", False)
+            and self.config.cross_attn_constant_dim > 0
+        ):
+            constant = trunc_normal_init_(
+                torch.empty(self.config.cross_attn_constant_dim, dtype=self.forward_dtype),
+                std=1.0,
+            )
+            self.cross_attn_constant = nn.Parameter(constant)
+            self.cross_attn_constant_projector = CastedLinear(
+                self.config.cross_attn_constant_dim,
+                self.config.hidden_size,
+                bias=False,
+            )
+        else:
+            self.register_parameter("cross_attn_constant", None)
+            self.cross_attn_constant_projector = None
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
         if self.config.puzzle_emb_ndim > 0:
@@ -256,7 +288,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # Scale + Normalize
         embedding = self.embed_scale * embedding
-        return self.embedding_out_norm(self.embedding_in_norm(embedding))
+        embedding = self.embedding_out_norm(self.embedding_in_norm(embedding))
+
+        cross_attn_context = None
+        if self.cross_attn_constant_projector is not None and self.cross_attn_constant is not None:
+            projected = self.cross_attn_constant_projector(self.cross_attn_constant)
+            cross_attn_context = projected.unsqueeze(0)
+
+        return embedding, cross_attn_context
 
     def empty_carry(self, batch_size: int):
         return TinyRecursiveReasoningModel_ACTV1InnerCarry(
@@ -276,7 +315,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         )
 
         # Input encoding
-        input_embeddings = self._input_embeddings(batch["inputs"], batch.get("puzzle_identifiers"))
+        input_embeddings, cross_attn_context = self._input_embeddings(
+            batch["inputs"], batch.get("puzzle_identifiers")
+        )
+        cross_attn_states = None
+        if cross_attn_context is not None:
+            cross_attn_states = cross_attn_context.unsqueeze(0).expand(
+                input_embeddings.shape[0], -1, -1
+            )
 
         # Forward iterations
         it = 0
@@ -285,12 +331,32 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-                z_H = self.L_level(z_H, z_L, **seq_info)
+                    z_L = self.L_level(
+                        z_L,
+                        z_H + input_embeddings,
+                        cross_attn_states=cross_attn_states,
+                        **seq_info,
+                    )
+                z_H = self.L_level(
+                    z_H,
+                    z_L,
+                    cross_attn_states=cross_attn_states,
+                    **seq_info,
+                )
         # 1 with grad
         for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.L_level(z_H, z_L, **seq_info)
+            z_L = self.L_level(
+                z_L,
+                z_H + input_embeddings,
+                cross_attn_states=cross_attn_states,
+                **seq_info,
+            )
+        z_H = self.L_level(
+            z_H,
+            z_L,
+            cross_attn_states=cross_attn_states,
+            **seq_info,
+        )
 
         # LM Outputs
         z_proj = self.output_out_norm(self.output_in_norm(z_H))
