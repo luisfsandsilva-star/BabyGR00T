@@ -21,6 +21,13 @@ class PuzzleDatasetMetadata(pydantic.BaseModel):
     total_puzzles: int
     sets: List[str]
 
+    # Extended metadata for regression-style datasets
+    task_type: str = "classification"
+    input_dim: Optional[int] = None
+    target_dim: Optional[int] = None
+    input_pad_value: Optional[float] = None
+    target_pad_value: Optional[float] = None
+
 
 def dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
     """8 dihedral symmetries by rotate, flip and mirror"""

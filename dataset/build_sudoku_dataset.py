@@ -2,6 +2,8 @@ from typing import Optional
 import os
 import csv
 import json
+from typing import Optional
+
 import numpy as np
 
 from argdantic import ArgParser
@@ -138,7 +140,10 @@ def convert_subset(set_name: str, config: DataProcessConfig):
         total_groups=len(results["group_indices"]) - 1,
         mean_puzzle_examples=1,
         total_puzzles=len(results["group_indices"]) - 1,
-        sets=["all"]
+        sets=["all"],
+        task_type="classification",
+        input_pad_value=0,
+        target_pad_value=-100,
     )
 
     # Save metadata as JSON.

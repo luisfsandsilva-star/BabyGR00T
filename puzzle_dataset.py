@@ -7,7 +7,6 @@ import pydantic
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-from models.losses import IGNORE_LABEL_ID
 from dataset.common import PuzzleDatasetMetadata
 
 from argdantic import ArgParser
@@ -63,6 +62,11 @@ class PuzzleDataset(IterableDataset):
         prev_blank_identifier_id = None
         prev_sets = None
         prev_num_identifiers = None
+        prev_task_type = None
+        prev_input_dim: Optional[int] = None
+        prev_target_dim: Optional[int] = None
+        prev_input_pad_value: Optional[float] = None
+        prev_target_pad_value: Optional[float] = None
         mean_puzzle_examples = 0
         total_puzzles = 0
         total_groups = 0
@@ -77,14 +81,41 @@ class PuzzleDataset(IterableDataset):
                 prev_blank_identifier_id = current_metadata.blank_identifier_id
                 prev_sets = current_metadata.sets
                 prev_num_identifiers = current_metadata.num_puzzle_identifiers
+                prev_task_type = current_metadata.task_type
+                prev_input_dim = current_metadata.input_dim
+                prev_target_dim = current_metadata.target_dim
+                prev_input_pad_value = current_metadata.input_pad_value
+                prev_target_pad_value = current_metadata.target_pad_value
             else:
-                assert prev_seq_len == current_metadata.seq_len
-                assert prev_vocab_size == current_metadata.vocab_size
-                assert prev_pad_id == current_metadata.pad_id
-                assert prev_ignore_label_id == current_metadata.ignore_label_id
+                assert prev_task_type == current_metadata.task_type
+                if prev_seq_len is not None and current_metadata.seq_len is not None:
+                    assert prev_seq_len == current_metadata.seq_len
+                if prev_vocab_size is not None and current_metadata.vocab_size is not None:
+                    assert prev_vocab_size == current_metadata.vocab_size
+                if prev_pad_id is not None:
+                    assert prev_pad_id == current_metadata.pad_id
+                if prev_ignore_label_id is not None or current_metadata.ignore_label_id is not None:
+                    assert prev_ignore_label_id == current_metadata.ignore_label_id
                 assert prev_blank_identifier_id == current_metadata.blank_identifier_id
                 assert prev_sets == current_metadata.sets
-                assert prev_num_identifiers == current_metadata.num_puzzle_identifiers
+                if prev_input_dim is None and current_metadata.input_dim is not None:
+                    prev_input_dim = current_metadata.input_dim
+                elif current_metadata.input_dim is not None:
+                    assert prev_input_dim == current_metadata.input_dim
+                if prev_target_dim is None and current_metadata.target_dim is not None:
+                    prev_target_dim = current_metadata.target_dim
+                elif current_metadata.target_dim is not None:
+                    assert prev_target_dim == current_metadata.target_dim
+                if prev_input_pad_value is None and current_metadata.input_pad_value is not None:
+                    prev_input_pad_value = current_metadata.input_pad_value
+                elif current_metadata.input_pad_value is not None:
+                    assert prev_input_pad_value == current_metadata.input_pad_value
+                if prev_target_pad_value is None and current_metadata.target_pad_value is not None:
+                    prev_target_pad_value = current_metadata.target_pad_value
+                elif current_metadata.target_pad_value is not None:
+                    assert prev_target_pad_value == current_metadata.target_pad_value
+                if current_metadata.task_type != "regression":
+                    assert prev_num_identifiers == current_metadata.num_puzzle_identifiers
             mean_puzzle_examples += current_metadata.mean_puzzle_examples*current_metadata.total_puzzles
             total_puzzles += current_metadata.total_puzzles
             total_groups += current_metadata.total_groups
@@ -101,7 +132,12 @@ class PuzzleDataset(IterableDataset):
             total_groups=total_groups,
             mean_puzzle_examples=mean_puzzle_examples,
             total_puzzles=total_puzzles,
-            sets=prev_sets
+            sets=prev_sets,
+            task_type=prev_task_type or "classification",
+            input_dim=prev_input_dim,
+            target_dim=prev_target_dim,
+            input_pad_value=prev_input_pad_value,
+            target_pad_value=prev_target_pad_value
         )
 
         # Checks
@@ -122,13 +158,19 @@ class PuzzleDataset(IterableDataset):
 
         field_mmap_modes = {
             "inputs": "r",
-            "labels": "r",
 
             # Keep indices in memory
             "puzzle_identifiers": None,
             "puzzle_indices": None,
-            "group_indices": None
+            "group_indices": None,
         }
+        if self.metadata.task_type == "regression":
+            field_mmap_modes.update({
+                "targets": "r",
+                "target_mask": "r",
+            })
+        else:
+            field_mmap_modes["labels"] = "r"
 
         # Load data
         self._data = {}
@@ -145,22 +187,65 @@ class PuzzleDataset(IterableDataset):
 
 
     def _collate_batch(self, batch):
-        # Convert dtype
-        batch = {k: v.astype(np.int32) for k, v in batch.items()}
+        converted = {}
+        for key, value in batch.items():
+            if key == "target_mask":
+                converted[key] = value.astype(np.bool_)
+            elif value.dtype.kind == "f":
+                converted[key] = value.astype(np.float32, copy=False)
+            else:
+                converted[key] = value.astype(np.int32)
 
-        # Convert ignore label IDs
-        if self.metadata.ignore_label_id is not None:
-            batch["labels"][batch["labels"] == self.metadata.ignore_label_id] = IGNORE_LABEL_ID
+        batch = converted
 
-        # Pad
+        # Convert ignore label IDs to configured padding value for classification tasks
+        if "labels" in batch and self.metadata.ignore_label_id is not None:
+            target_pad_value = (
+                self.metadata.target_pad_value
+                if self.metadata.target_pad_value is not None
+                else self.metadata.ignore_label_id
+            )
+            batch["labels"][batch["labels"] == self.metadata.ignore_label_id] = target_pad_value
+
+        # Pad to local batch size
         if batch["puzzle_identifiers"].size < self.local_batch_size:
             pad_size = self.local_batch_size - batch["puzzle_identifiers"].size
             pad_values = {
-                "inputs": self.metadata.pad_id,
-                "labels": IGNORE_LABEL_ID,
-                "puzzle_identifiers": self.metadata.blank_identifier_id
+                "inputs": (
+                    self.metadata.input_pad_value
+                    if self.metadata.input_pad_value is not None
+                    else self.metadata.pad_id
+                ),
+                "puzzle_identifiers": self.metadata.blank_identifier_id,
             }
-            batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k]) for k, v in batch.items()}
+
+            if "labels" in batch:
+                pad_values["labels"] = (
+                    self.metadata.target_pad_value
+                    if self.metadata.target_pad_value is not None
+                    else (
+                        self.metadata.ignore_label_id
+                        if self.metadata.ignore_label_id is not None
+                        else 0
+                    )
+                )
+            if "targets" in batch:
+                pad_values["targets"] = float(
+                    self.metadata.target_pad_value
+                    if self.metadata.target_pad_value is not None
+                    else 0.0
+                )
+            if "target_mask" in batch:
+                pad_values["target_mask"] = False
+
+            batch = {
+                key: np.pad(
+                    value,
+                    ((0, pad_size),) + ((0, 0),) * (value.ndim - 1),
+                    constant_values=pad_values[key],
+                )
+                for key, value in batch.items()
+            }
 
         # To tensor
         return {k: torch.from_numpy(v) for k, v in batch.items()}
@@ -187,11 +272,18 @@ class PuzzleDataset(IterableDataset):
 
                     puzzle_indices.append(puzzle_index)
                 
-                batch = self._collate_batch({
+                batch_dict = {
                     "inputs": dataset["inputs"][local_start: local_end],
-                    "labels": dataset["labels"][local_start: local_end],
-                    "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
-                })
+                    "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices],
+                }
+                if "labels" in dataset:
+                    batch_dict["labels"] = dataset["labels"][local_start: local_end]
+                if "targets" in dataset:
+                    batch_dict["targets"] = dataset["targets"][local_start: local_end]
+                if "target_mask" in dataset:
+                    batch_dict["target_mask"] = dataset["target_mask"][local_start: local_end]
+
+                batch = self._collate_batch(batch_dict)
 
                 yield set_name, batch, end_index - start_index
                 
@@ -228,11 +320,18 @@ class PuzzleDataset(IterableDataset):
 
                 batch_indices        = batch_indices       [self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
                 batch_puzzle_indices = batch_puzzle_indices[self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
-                batch = self._collate_batch({
+                batch_dict = {
                     "inputs": dataset["inputs"][batch_indices],
-                    "labels": dataset["labels"][batch_indices],
-                    "puzzle_identifiers": dataset["puzzle_identifiers"][batch_puzzle_indices]
-                })
+                    "puzzle_identifiers": dataset["puzzle_identifiers"][batch_puzzle_indices],
+                }
+                if "labels" in dataset:
+                    batch_dict["labels"] = dataset["labels"][batch_indices]
+                if "targets" in dataset:
+                    batch_dict["targets"] = dataset["targets"][batch_indices]
+                if "target_mask" in dataset:
+                    batch_dict["target_mask"] = dataset["target_mask"][batch_indices]
+
+                batch = self._collate_batch(batch_dict)
 
                 yield set_name, batch, global_effective_batch_size
                 

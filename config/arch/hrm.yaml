@@ -2,6 +2,7 @@ name: recursive_reasoning.hrm@HierarchicalReasoningModel_ACTV1
 loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
+  # For regression experiments use losses@ACTRegressionLossHead and configure mse_weight/mae_weight if desired.
 
 halt_exploration_prob: 0.1
 halt_max_steps: 16

@@ -57,6 +57,8 @@ python dataset/build_sudoku_dataset.py --output-dir data/sudoku-extreme-1k-aug-1
 python dataset/build_maze_dataset.py # 1000 examples, 8 augments
 ```
 
+> **Regression datasets:** When exporting new data, ensure the generated `dataset.json` includes the extended metadata (`task_type`, `input_dim`, `target_dim`, `input_pad_value`, and `target_pad_value`). Regression tasks must set `task_type: "regression"`, provide float32 `targets`/`target_mask` arrays (saved as `.npy`/`.npz`), and train with the `losses@ACTRegressionLossHead` loss head (configurable via `arch.loss` in the YAML configs).
+
 ## Experiments
 
 ### ARC-AGI-1 (assuming 4 H-100 GPUs):
