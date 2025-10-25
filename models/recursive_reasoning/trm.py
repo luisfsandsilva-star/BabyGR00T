@@ -55,6 +55,8 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
 
     # Transformer config
     hidden_size: int
+    latent_dim: Optional[int] = None
+    output_dim: Optional[int] = None
     expansion: float
     num_heads: int
     pos_encodings: str
@@ -72,6 +74,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
     use_cross_attn: bool = False
+    keep_act_halting_head: bool = True
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -175,15 +178,19 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
+        self.latent_dim = self.config.latent_dim or self.config.hidden_size
+        self.output_dim = self.config.output_dim or self.config.hidden_size
+        self.config.latent_dim = self.latent_dim
+        self.config.output_dim = self.output_dim
 
         # I/O
 
         self.embed_scale = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-        self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
+        self.input_projector = CastedLinear(self.latent_dim, self.config.hidden_size, bias=False)
+        self.regression_head = CastedLinear(self.config.hidden_size, self.output_dim, bias=True)
+        self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True) if self.config.keep_act_halting_head else None
         self.embedding_in_norm = make_inbound_scalenorm(self.config.hidden_size)
         self.embedding_out_norm = make_outbound_scalenorm(self.config.hidden_size)
         self.output_in_norm = make_inbound_scalenorm(self.config.hidden_size)
@@ -214,23 +221,33 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
-        with torch.no_grad():
-            self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)  # type: ignore
+        if self.q_head is not None:
+            with torch.no_grad():
+                self.q_head.weight.zero_()
+                self.q_head.bias.fill_(-5)  # type: ignore
 
-    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
+    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: Optional[torch.Tensor]):
         # Token embedding
-        embedding = self.embed_tokens(input.to(torch.int32))
+        embedding = self.input_projector(input.to(self.forward_dtype))
 
         # Puzzle embeddings
-        if self.config.puzzle_emb_ndim > 0:
+        if self.config.puzzle_emb_ndim > 0 and puzzle_identifiers is not None:
             puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
-            
+
             pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
             if pad_count > 0:
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
 
             embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
+        elif self.puzzle_emb_len > 0:
+            zeros = torch.zeros(
+                embedding.shape[0],
+                self.puzzle_emb_len,
+                self.config.hidden_size,
+                dtype=self.forward_dtype,
+                device=embedding.device,
+            )
+            embedding = torch.cat((zeros, embedding), dim=-2)
 
         # Position embeddings
         if self.config.pos_encodings == "learned":
@@ -253,13 +270,13 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
 
         # Input encoding
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        input_embeddings = self._input_embeddings(batch["inputs"], batch.get("puzzle_identifiers"))
 
         # Forward iterations
         it = 0
@@ -278,14 +295,12 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # LM Outputs
         z_proj = self.output_out_norm(self.output_in_norm(z_H))
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self._cosine_logits(z_proj)[:, self.puzzle_emb_len:]
+        output = self.regression_head(z_proj)[:, self.puzzle_emb_len:]
+        if self.q_head is None:
+            return new_carry, output, None
+
         q_logits = self.q_head(z_proj[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
-
-    def _cosine_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = F.normalize(hidden_states, dim=-1)
-        weight = F.normalize(self.lm_head.weight.to(hidden_states.dtype), dim=-1)
-        return self.embed_scale * F.linear(hidden_states, weight)
 
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):
@@ -322,27 +337,33 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, q_logits = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
-            "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits
         }
+        if q_logits is not None:
+            q_halt_logits, q_continue_logits = q_logits
+            outputs.update({
+                "q_halt_logits": q_halt_logits,
+                "q_continue_logits": q_continue_logits
+            })
+        else:
+            q_halt_logits = q_continue_logits = None
 
         with torch.no_grad():
             # Step
             new_steps = new_steps + 1
             is_last_step = new_steps >= self.config.halt_max_steps
-            
+
             halted = is_last_step
 
             # if training, and ACT is enabled
-            if self.training and (self.config.halt_max_steps > 1):
+            if self.training and (self.config.halt_max_steps > 1) and (q_halt_logits is not None):
 
                 # Halt signal
                 # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
-                
+
                 if self.config.no_ACT_continue:
                     halted = halted | (q_halt_logits > 0)
                 else:
@@ -357,7 +378,15 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     # NOTE: No replay buffer and target networks for computing target Q-value.
                     # As batch_size is large, there're many parallel envs.
                     # Similar concept as PQN https://arxiv.org/abs/2407.04811
-                    _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
-                    outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+                    _, _, next_q_logits = self.inner(new_inner_carry, new_current_data)
+                    if next_q_logits is not None:
+                        next_q_halt_logits, next_q_continue_logits = next_q_logits
+                        outputs["target_q_continue"] = torch.sigmoid(
+                            torch.where(
+                                is_last_step,
+                                next_q_halt_logits,
+                                torch.maximum(next_q_halt_logits, next_q_continue_logits),
+                            )
+                        )
 
         return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
