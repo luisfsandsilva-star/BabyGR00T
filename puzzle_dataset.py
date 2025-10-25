@@ -180,10 +180,40 @@ class PuzzleDataset(IterableDataset):
                     set_name_ = set_name + str(i)
                 else:
                     set_name_ = set_name
-                self._data[set_name_] = {
-                    field_name: np.load(os.path.join(dataset_path, self.split, f"{set_name}__{field_name}.npy"), mmap_mode=mmap_mode)
-                    for field_name, mmap_mode in field_mmap_modes.items()
-                }
+
+                set_data = {}
+                for field_name, mmap_mode in field_mmap_modes.items():
+                    base_path = os.path.join(
+                        dataset_path,
+                        self.split,
+                        f"{set_name}__{field_name}",
+                    )
+
+                    npy_path = base_path + ".npy"
+                    if os.path.exists(npy_path):
+                        set_data[field_name] = np.load(npy_path, mmap_mode=mmap_mode)
+                        continue
+
+                    npz_path = base_path + ".npz"
+                    if os.path.exists(npz_path):
+                        with np.load(npz_path) as npz_file:
+                            if len(npz_file.files) == 1:
+                                array = npz_file[npz_file.files[0]]
+                            else:
+                                key = field_name
+                                if key not in npz_file.files:
+                                    raise KeyError(
+                                        f"NPZ file '{npz_path}' does not contain expected key '{key}'."
+                                    )
+                                array = npz_file[key]
+                        set_data[field_name] = array
+                        continue
+
+                    raise FileNotFoundError(
+                        f"Missing dataset field '{field_name}' at '{npy_path}' or '{npz_path}'."
+                    )
+
+                self._data[set_name_] = set_data
 
 
     def _collate_batch(self, batch):
