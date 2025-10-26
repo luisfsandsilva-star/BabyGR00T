@@ -10,7 +10,16 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
 
 
-def _write_episode_dataset(base_dir: Path, latents_sequences, group_names, puzzle_ids, set_name: str) -> None:
+def _write_episode_dataset(
+    base_dir: Path,
+    latents_sequences,
+    group_names,
+    puzzle_ids,
+    set_name: str,
+    *,
+    use_jsonl: bool = False,
+    extra_jsonl_records=None,
+) -> None:
     split_dir = base_dir / "train"
     latents_dir = split_dir / "latents"
     metadata_dir = split_dir / "metadata"
@@ -26,8 +35,16 @@ def _write_episode_dataset(base_dir: Path, latents_sequences, group_names, puzzl
             "group": group_names[idx],
             "puzzle_identifier": puzzle_ids[idx],
         }
-        with open(metadata_dir / f"{episode_name}.json", "w", encoding="utf-8") as metadata_file:
-            json.dump(metadata, metadata_file)
+        if use_jsonl:
+            records = [metadata]
+            if extra_jsonl_records:
+                records.extend(extra_jsonl_records)
+            with open(metadata_dir / f"{episode_name}.jsonl", "w", encoding="utf-8") as metadata_file:
+                for record in records:
+                    metadata_file.write(json.dumps(record) + "\n")
+        else:
+            with open(metadata_dir / f"{episode_name}.json", "w", encoding="utf-8") as metadata_file:
+                json.dump(metadata, metadata_file)
 
 
 def test_episode_metadata_and_batching(tmp_path):
@@ -152,3 +169,55 @@ def test_episode_metadata_and_batching(tmp_path):
         assert batch["targets"].dtype == torch.float32
         assert batch["target_mask"].dtype == torch.bool
         assert batch["puzzle_identifiers"].dtype == torch.int32
+
+
+def test_episode_metadata_from_jsonl(tmp_path):
+    dataset_dir = tmp_path / "dataset_jsonl"
+    latents_dir = dataset_dir / "train" / "latents"
+    metadata_dir = dataset_dir / "train" / "metadata"
+    latents_dir.mkdir(parents=True, exist_ok=True)
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+
+    latents = np.array(
+        [
+            [0.0, 0.1, 0.2],
+            [0.3, 0.4, 0.5],
+            [0.6, 0.7, 0.8],
+        ],
+        dtype=np.float32,
+    )
+    np.savez(latents_dir / "episode_000.npz", latents=latents)
+
+    with open(metadata_dir / "episode_000.jsonl", "w", encoding="utf-8") as metadata_file:
+        metadata_file.write(json.dumps({"set": "jsonlset", "group": "jsonl_group"}) + "\n")
+        metadata_file.write(json.dumps({"puzzle_identifier": 42}) + "\n")
+
+    config = PuzzleDatasetConfig(
+        seed=0,
+        dataset_paths=[str(dataset_dir)],
+        global_batch_size=4,
+        test_set_mode=True,
+        epochs_per_iter=1,
+        rank=0,
+        num_replicas=1,
+    )
+
+    dataset = PuzzleDataset(config)
+
+    episode_info = dataset._episode_datasets[str(dataset_dir)]
+    assert episode_info.episodes[0].metadata.set_name == "jsonlset"
+    assert episode_info.episodes[0].metadata.group_name == "jsonl_group"
+    assert episode_info.episodes[0].metadata.puzzle_identifier == 42
+
+    dataset._lazy_load_dataset()
+    set_data = dataset._data["jsonlset"]
+    assert np.array_equal(set_data["puzzle_identifiers"], np.array([42], dtype=np.int32))
+
+    outputs = list(dataset)
+    assert len(outputs) == 1
+    set_name, batch, effective = outputs[0]
+    assert set_name == "jsonlset"
+    assert effective == 2
+    assert batch["puzzle_identifiers"].dtype == torch.int32
+    assert batch["puzzle_identifiers"][0:effective].tolist() == [42, 42]
+    assert batch["puzzle_identifiers"][effective:].tolist() == [0, 0]

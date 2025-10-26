@@ -188,14 +188,38 @@ class EpisodeDatasetInfo:
             elif dtype != inferred_dtype:
                 raise ValueError("All episodes must share the same dtype.")
 
-            metadata_path = os.path.join(
+            metadata_stem = os.path.join(
                 self.metadata_dir,
-                filename.replace(".npz", ".json"),
+                filename.replace(".npz", ""),
             )
+            metadata_json_path = metadata_stem + ".json"
+            metadata_jsonl_path = metadata_stem + ".jsonl"
 
             metadata_dict: Dict[str, Optional[str]] = {}
-            if os.path.isfile(metadata_path):
-                with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+            if os.path.isfile(metadata_jsonl_path):
+                collected: Dict[str, Optional[str]] = {}
+                with open(metadata_jsonl_path, "r", encoding="utf-8") as metadata_file:
+                    for line in metadata_file:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(record, dict):
+                            continue
+                        for key in ("set", "group", "puzzle_identifier"):
+                            if key not in collected and key in record:
+                                collected[key] = record[key]
+                        if all(key in collected for key in ("set", "group", "puzzle_identifier")):
+                            break
+                metadata_dict = collected
+                if not metadata_dict and os.path.isfile(metadata_json_path):
+                    with open(metadata_json_path, "r", encoding="utf-8") as metadata_file:
+                        metadata_dict = json.load(metadata_file)
+            elif os.path.isfile(metadata_json_path):
+                with open(metadata_json_path, "r", encoding="utf-8") as metadata_file:
                     metadata_dict = json.load(metadata_file)
 
             set_name = metadata_dict.get("set", "episodes") if metadata_dict else "episodes"
