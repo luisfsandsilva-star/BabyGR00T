@@ -1,6 +1,9 @@
 import os
 import json
-from typing import Tuple, List, Dict, Optional
+import zipfile
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
+from typing import Tuple, List, Dict, Optional, Iterable
 import numpy as np
 import pydantic
 
@@ -11,6 +14,314 @@ from dataset.common import PuzzleDatasetMetadata
 
 from argdantic import ArgParser
 from pydantic import BaseModel
+
+
+def _read_npy_header_from_zip(zip_path: str, member: str) -> Tuple[Tuple[int, ...], np.dtype]:
+    """Read the shape and dtype for ``member`` stored inside ``zip_path``."""
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        if member not in zf.namelist():
+            raise FileNotFoundError(f"Missing member '{member}' in '{zip_path}'.")
+        with zf.open(member) as member_file:
+            version = np.lib.format.read_magic(member_file)
+            if version == (1, 0):
+                shape, _, dtype = np.lib.format.read_array_header_1_0(member_file)
+            elif version == (2, 0):
+                shape, _, dtype = np.lib.format.read_array_header_2_0(member_file)
+            else:
+                raise ValueError(f"Unsupported npy version {version} in '{zip_path}'.")
+    return shape, np.dtype(dtype)
+
+
+@dataclass
+class EpisodeMetadata:
+    set_name: str
+    group_name: str
+    puzzle_identifier: int
+
+
+@dataclass
+class Episode:
+    npz_path: str
+    metadata: EpisodeMetadata
+    length: int
+
+    @property
+    def num_examples(self) -> int:
+        return max(0, self.length - 1)
+
+
+class EpisodeSetData:
+    def __init__(self, info: "EpisodeDatasetInfo", set_name: str, episode_indices: Iterable[int]):
+        self.info = info
+        self.set_name = set_name
+        self._episode_indices: List[int] = []
+
+        group_to_episodes: Dict[str, List[int]] = defaultdict(list)
+        for episode_index in episode_indices:
+            episode = info.episodes[episode_index]
+            group_to_episodes[episode.metadata.group_name].append(episode_index)
+
+        self.group_names = sorted(group_to_episodes)
+        self.group_indices = np.zeros(len(self.group_names) + 1, dtype=np.int32)
+
+        for group_idx, group_name in enumerate(self.group_names):
+            group_episode_indices = sorted(group_to_episodes[group_name])
+            self._episode_indices.extend(group_episode_indices)
+            self.group_indices[group_idx + 1] = len(self._episode_indices)
+
+        self.puzzle_identifiers = np.zeros(len(self._episode_indices), dtype=np.int32)
+        self.example_prefix = np.zeros(len(self._episode_indices) + 1, dtype=np.int64)
+        for idx, episode_index in enumerate(self._episode_indices):
+            episode = info.episodes[episode_index]
+            self.puzzle_identifiers[idx] = episode.metadata.puzzle_identifier
+            self.example_prefix[idx + 1] = self.example_prefix[idx] + episode.num_examples
+
+        self.total_examples = int(self.example_prefix[-1])
+
+    def normalize_indices(self, index) -> Tuple[np.ndarray, bool]:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self.total_examples)
+            indices = np.arange(start, stop, step, dtype=np.int64)
+            return indices, False
+
+        if isinstance(index, (list, tuple)):
+            arr = np.asarray(index, dtype=np.int64)
+            return arr, False
+
+        arr = np.asarray(index)
+        if arr.ndim == 0:
+            arr = arr.reshape(1)
+            return arr.astype(np.int64), True
+        return arr.astype(np.int64), False
+
+    def gather(self, indices: np.ndarray, offset: int) -> np.ndarray:
+        feature_dim = self.info.feature_dim
+        result = np.empty((indices.size, feature_dim), dtype=self.info.dtype)
+        for out_idx, value in enumerate(indices):
+            episode_pos = int(np.searchsorted(self.example_prefix, value, side="right") - 1)
+            if episode_pos < 0:
+                raise IndexError("Index out of bounds for episode data")
+            episode_index = self._episode_indices[episode_pos]
+            local_index = int(value - self.example_prefix[episode_pos])
+            latents = self.info.get_episode_latents(episode_index)
+            result[out_idx] = latents[local_index + offset]
+        return result
+
+
+class EpisodeLatentField:
+    def __init__(self, set_data: EpisodeSetData, offset: int):
+        self.set_data = set_data
+        self.offset = offset
+
+    def __len__(self) -> int:
+        return self.set_data.total_examples
+
+    def __getitem__(self, index):
+        indices, is_scalar = self.set_data.normalize_indices(index)
+        gathered = self.set_data.gather(indices, self.offset)
+        if is_scalar:
+            return gathered[0]
+        return gathered
+
+
+class EpisodeMaskField:
+    def __init__(self, set_data: EpisodeSetData):
+        self.set_data = set_data
+
+    def __len__(self) -> int:
+        return self.set_data.total_examples
+
+    def __getitem__(self, index):
+        indices, is_scalar = self.set_data.normalize_indices(index)
+        mask = np.ones((indices.size, self.set_data.info.feature_dim), dtype=np.bool_)
+        if is_scalar:
+            return mask[0]
+        return mask
+
+
+class EpisodeDatasetInfo:
+    CACHE_SIZE = 8
+
+    def __init__(self, dataset_path: str, split: str):
+        self.dataset_path = dataset_path
+        self.split = split
+        self.latents_dir = os.path.join(dataset_path, split, "latents")
+        self.metadata_dir = os.path.join(dataset_path, split, "metadata")
+        self.episodes: List[Episode] = []
+        self._set_to_episode_indices: Dict[str, List[int]] = defaultdict(list)
+        self._episode_cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
+        self.identifier_offset: int = 0
+
+        if not os.path.isdir(self.latents_dir):
+            raise FileNotFoundError(f"Expected directory '{self.latents_dir}'.")
+
+        npz_files = sorted(
+            filename
+            for filename in os.listdir(self.latents_dir)
+            if filename.startswith("episode_") and filename.endswith(".npz")
+        )
+
+        if not npz_files:
+            raise FileNotFoundError(f"No episode archives found in '{self.latents_dir}'.")
+
+        feature_dim: Optional[int] = None
+        dtype: Optional[np.dtype] = None
+        default_identifier = 0
+
+        for filename in npz_files:
+            npz_path = os.path.join(self.latents_dir, filename)
+            shape, inferred_dtype = _read_npy_header_from_zip(npz_path, "latents.npy")
+            if len(shape) < 1:
+                raise ValueError(f"Latents stored in '{npz_path}' must be at least 1-D.")
+
+            episode_length = int(shape[0])
+            current_feature_dim = int(np.prod(shape[1:])) if len(shape) > 1 else 1
+
+            if feature_dim is None:
+                feature_dim = current_feature_dim
+            elif feature_dim != current_feature_dim:
+                raise ValueError("All episodes must share the same latent dimensionality.")
+
+            if dtype is None:
+                dtype = inferred_dtype
+            elif dtype != inferred_dtype:
+                raise ValueError("All episodes must share the same dtype.")
+
+            metadata_path = os.path.join(
+                self.metadata_dir,
+                filename.replace(".npz", ".json"),
+            )
+
+            metadata_dict: Dict[str, Optional[str]] = {}
+            if os.path.isfile(metadata_path):
+                with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+                    metadata_dict = json.load(metadata_file)
+
+            set_name = metadata_dict.get("set", "episodes") if metadata_dict else "episodes"
+            group_name_raw = metadata_dict.get("group", set_name) if metadata_dict else set_name
+            group_name = str(group_name_raw)
+
+            if metadata_dict and "puzzle_identifier" in metadata_dict:
+                puzzle_identifier = int(metadata_dict["puzzle_identifier"])
+                default_identifier = max(default_identifier, puzzle_identifier + 1)
+            else:
+                puzzle_identifier = default_identifier
+                default_identifier += 1
+
+            episode_metadata = EpisodeMetadata(
+                set_name=set_name,
+                group_name=group_name,
+                puzzle_identifier=puzzle_identifier,
+            )
+
+            episode = Episode(
+                npz_path=npz_path,
+                metadata=episode_metadata,
+                length=episode_length,
+            )
+            self.episodes.append(episode)
+            self._set_to_episode_indices[set_name].append(len(self.episodes) - 1)
+
+        self.feature_dim = feature_dim if feature_dim is not None else 1
+        self.dtype = dtype if dtype is not None else np.float32
+        self.latent_shape = (self.feature_dim,)
+
+        self.sets: Dict[str, EpisodeSetData] = {
+            set_name: EpisodeSetData(self, set_name, indices)
+            for set_name, indices in self._set_to_episode_indices.items()
+        }
+
+    @property
+    def total_examples(self) -> int:
+        return sum(episode.num_examples for episode in self.episodes)
+
+    @property
+    def total_puzzles(self) -> int:
+        return len(self.episodes)
+
+    @property
+    def total_groups(self) -> int:
+        return sum(len(set_data.group_names) for set_data in self.sets.values())
+
+    @property
+    def metadata(self) -> PuzzleDatasetMetadata:
+        total_examples = self.total_examples
+        total_puzzles = self.total_puzzles
+        denominator = total_puzzles if total_puzzles else 1
+        mean_examples = total_examples / denominator
+        unique_identifiers = len({episode.metadata.puzzle_identifier for episode in self.episodes})
+        return PuzzleDatasetMetadata(
+            pad_id=0,
+            ignore_label_id=None,
+            blank_identifier_id=0,
+            vocab_size=0,
+            seq_len=1,
+            num_puzzle_identifiers=unique_identifiers,
+            total_groups=self.total_groups,
+            mean_puzzle_examples=mean_examples,
+            total_puzzles=self.total_puzzles,
+            sets=sorted(self.sets.keys()),
+            task_type="regression",
+            input_dim=self.feature_dim,
+            target_dim=self.feature_dim,
+            input_pad_value=0.0,
+            target_pad_value=0.0,
+        )
+
+    def set_identifier_offset(self, offset: int) -> None:
+        self.identifier_offset = offset
+
+    def get_episode_latents(self, episode_index: int) -> np.ndarray:
+        if episode_index in self._episode_cache:
+            latents = self._episode_cache.pop(episode_index)
+            self._episode_cache[episode_index] = latents
+            return latents
+
+        episode = self.episodes[episode_index]
+        with np.load(episode.npz_path) as npz_file:
+            if "latents" in npz_file.files:
+                latents = npz_file["latents"].astype(self.dtype, copy=False)
+            elif "arr_0" in npz_file.files:
+                latents = npz_file["arr_0"].astype(self.dtype, copy=False)
+            else:
+                raise KeyError(f"Episode archive '{episode.npz_path}' does not contain latents array.")
+
+        latents = latents.reshape(latents.shape[0], self.feature_dim)
+
+        self._episode_cache[episode_index] = latents
+        while len(self._episode_cache) > self.CACHE_SIZE:
+            self._episode_cache.popitem(last=False)
+
+        return latents
+
+    def get_set_latent_field(self, set_name: str, offset: int) -> EpisodeLatentField:
+        return EpisodeLatentField(self.sets[set_name], offset)
+
+    def get_set_mask_field(self, set_name: str) -> EpisodeMaskField:
+        return EpisodeMaskField(self.sets[set_name])
+
+    def get_set_puzzle_identifiers(self, set_name: str) -> np.ndarray:
+        base = self.sets[set_name].puzzle_identifiers + self.identifier_offset
+        return base.astype(np.int32)
+
+    def get_set_puzzle_indices(self, set_name: str) -> np.ndarray:
+        return self.sets[set_name].example_prefix.astype(np.int32)
+
+    def get_set_group_indices(self, set_name: str) -> np.ndarray:
+        return self.sets[set_name].group_indices.astype(np.int32)
+
+    @classmethod
+    def from_path(cls, dataset_path: str, split: str) -> Optional["EpisodeDatasetInfo"]:
+        dataset_json = os.path.join(dataset_path, split, "dataset.json")
+        if os.path.isfile(dataset_json):
+            return None
+
+        latents_dir = os.path.join(dataset_path, split, "latents")
+        if not os.path.isdir(latents_dir):
+            return None
+
+        return cls(dataset_path, split)
 
 def _sample_batch(rng: np.random.Generator, group_order: np.ndarray, puzzle_indices: np.ndarray, group_indices: np.ndarray, start_index: int, global_batch_size: int):
     # Pack examples into a full batch
@@ -53,6 +364,7 @@ class PuzzleDataset(IterableDataset):
         super().__init__()
         self.config = config
         self.split = split
+        self._episode_datasets: Dict[str, EpisodeDatasetInfo] = {}
 
         # Merge multiple metadata
         prev_seq_len = None
@@ -73,6 +385,9 @@ class PuzzleDataset(IterableDataset):
         num_identifiers = 0
         for dataset_path in config.dataset_paths:
             current_metadata = self._load_metadata(dataset_path)
+            episode_info = self._episode_datasets.get(dataset_path)
+            if episode_info is not None:
+                episode_info.set_identifier_offset(num_identifiers)
             if prev_seq_len is None:
                 prev_seq_len = current_metadata.seq_len
                 prev_vocab_size = current_metadata.vocab_size
@@ -149,6 +464,11 @@ class PuzzleDataset(IterableDataset):
         self._iters = 0
 
     def _load_metadata(self, dataset_path) -> PuzzleDatasetMetadata:
+        episode_info = EpisodeDatasetInfo.from_path(dataset_path, self.split)
+        if episode_info is not None:
+            self._episode_datasets[dataset_path] = episode_info
+            return episode_info.metadata
+
         with open(os.path.join(dataset_path, self.split, "dataset.json"), "r") as f:
             return PuzzleDatasetMetadata(**json.load(f))
 
@@ -180,6 +500,21 @@ class PuzzleDataset(IterableDataset):
                     set_name_ = set_name + str(i)
                 else:
                     set_name_ = set_name
+
+                if dataset_path in self._episode_datasets:
+                    episode_info = self._episode_datasets[dataset_path]
+                    if set_name not in episode_info.sets:
+                        continue
+                    set_data = {
+                        "inputs": episode_info.get_set_latent_field(set_name, offset=0),
+                        "targets": episode_info.get_set_latent_field(set_name, offset=1),
+                        "target_mask": episode_info.get_set_mask_field(set_name),
+                        "puzzle_identifiers": episode_info.get_set_puzzle_identifiers(set_name),
+                        "puzzle_indices": episode_info.get_set_puzzle_indices(set_name),
+                        "group_indices": episode_info.get_set_group_indices(set_name),
+                    }
+                    self._data[set_name_] = set_data
+                    continue
 
                 set_data = {}
                 for field_name, mmap_mode in field_mmap_modes.items():
