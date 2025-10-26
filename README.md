@@ -59,6 +59,8 @@ python dataset/build_maze_dataset.py # 1000 examples, 8 augments
 
 > **Regression datasets:** When exporting new data, ensure the generated `dataset.json` includes the extended metadata (`task_type`, `input_dim`, `target_dim`, `input_pad_value`, and `target_pad_value`). Regression tasks must set `task_type: "regression"`, provide float32 `targets`/`target_mask` arrays (saved as `.npy`/`.npz`), and train with the `losses@ACTRegressionLossHead` loss head (configurable via `arch.loss` in the YAML configs). The loader first looks for `.npy` files and automatically falls back to sibling `.npz` archives; when saving `.npz`, either store a single unnamed array or place the data under a key that matches the field name (e.g., `targets` or `target_mask`).
 
+> **Latent episode datasets (.npz):** `PuzzleDataset` can also stream autoregressive targets directly from episode archives when a split directory omits `dataset.json`. Place each task under `data_path/<split>/` with two folders: `latents/episode_XXX.npz` (containing a `latents.npy` array saved via `np.savez`) and optional metadata files in `metadata/episode_XXX.json`. Metadata files may specify the `set` name, a `group`, and a `puzzle_identifier`; unspecified identifiers are auto-incremented. At load time the dataset infers the latent dimensionality, builds prefix sums across episodes, and creates lazy views for inputs, targets (the next latent for teacher forcing), and boolean masks. Multiple episode folders can be supplied through `data_paths=[...]`—puzzle identifiers are offset automatically to avoid collisions across tasks.
+
 ## Experiments
 
 ### ARC-AGI-1 (assuming 4 H-100 GPUs):
