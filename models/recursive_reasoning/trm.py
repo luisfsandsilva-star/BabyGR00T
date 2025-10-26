@@ -262,6 +262,9 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # Token embedding
         embedding = self.input_projector(input.to(self.forward_dtype))
 
+        if embedding.ndim == 2:
+            embedding = embedding.unsqueeze(1)
+
         # Puzzle embeddings
         if self.config.puzzle_emb_ndim > 0 and puzzle_identifiers is not None:
             puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
@@ -270,15 +273,12 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             if pad_count > 0:
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
 
-            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
-        elif self.puzzle_emb_len > 0:
-            zeros = torch.zeros(
-                embedding.shape[0],
-                self.puzzle_emb_len,
-                self.config.hidden_size,
-                dtype=self.forward_dtype,
-                device=embedding.device,
+            puzzle_embedding = puzzle_embedding.view(
+                puzzle_embedding.shape[0], self.puzzle_emb_len, self.config.hidden_size
             )
+            embedding = torch.cat((puzzle_embedding, embedding), dim=-2)
+        elif self.puzzle_emb_len > 0:
+            zeros = embedding.new_zeros((embedding.shape[0], self.puzzle_emb_len, self.config.hidden_size))
             embedding = torch.cat((zeros, embedding), dim=-2)
 
         # Position embeddings
