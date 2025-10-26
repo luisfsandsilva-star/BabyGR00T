@@ -146,15 +146,31 @@ class EpisodeDatasetInfo:
     def __init__(self, dataset_path: str, split: str):
         self.dataset_path = dataset_path
         self.split = split
-        self.latents_dir = os.path.join(dataset_path, split, "latents")
-        self.metadata_dir = os.path.join(dataset_path, split, "metadata")
+        split_latents_dir = os.path.join(dataset_path, split, "latents")
+        root_latents_dir = os.path.join(dataset_path, "latents")
+        if os.path.isdir(split_latents_dir):
+            self.latents_dir = split_latents_dir
+        elif os.path.isdir(root_latents_dir):
+            self.latents_dir = root_latents_dir
+        else:
+            raise FileNotFoundError(
+                f"Expected directory '{split_latents_dir}' or '{root_latents_dir}'."
+            )
+
+        split_metadata_dir = os.path.join(dataset_path, split, "metadata")
+        root_metadata_dir = os.path.join(dataset_path, "metadata")
+        if os.path.isdir(split_metadata_dir):
+            self.metadata_dir = split_metadata_dir
+        elif os.path.isdir(root_metadata_dir):
+            self.metadata_dir = root_metadata_dir
+        else:
+            raise FileNotFoundError(
+                f"Expected directory '{split_metadata_dir}' or '{root_metadata_dir}'."
+            )
         self.episodes: List[Episode] = []
         self._set_to_episode_indices: Dict[str, List[int]] = defaultdict(list)
         self._episode_cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
         self.identifier_offset: int = 0
-
-        if not os.path.isdir(self.latents_dir):
-            raise FileNotFoundError(f"Expected directory '{self.latents_dir}'.")
 
         npz_files = sorted(
             filename
@@ -341,8 +357,9 @@ class EpisodeDatasetInfo:
         if os.path.isfile(dataset_json):
             return None
 
-        latents_dir = os.path.join(dataset_path, split, "latents")
-        if not os.path.isdir(latents_dir):
+        split_latents_dir = os.path.join(dataset_path, split, "latents")
+        root_latents_dir = os.path.join(dataset_path, "latents")
+        if not (os.path.isdir(split_latents_dir) or os.path.isdir(root_latents_dir)):
             return None
 
         return cls(dataset_path, split)
