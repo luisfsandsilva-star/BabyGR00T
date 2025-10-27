@@ -171,9 +171,9 @@ class ACTRegressionLossHead(nn.Module):
         with torch.no_grad():
             outputs["preds"] = predictions.detach()
 
-        metrics: Dict[str, torch.Tensor] = {
+        raw_metrics: Dict[str, torch.Tensor] = {
             "count": valid_sequences.sum(),
-            "regression_loss": total_loss.detach(),
+            "regression_loss": total_loss,
             "mse": torch.where(valid_sequences, per_example_mse, torch.zeros_like(per_example_mse)).sum(),
             "mae": torch.where(valid_sequences, per_example_mae, torch.zeros_like(per_example_mae)).sum(),
             "steps": torch.where(
@@ -184,6 +184,8 @@ class ACTRegressionLossHead(nn.Module):
             "q_halt_loss": torch.zeros((), dtype=predictions.dtype, device=predictions.device),
             "q_continue_loss": torch.zeros((), dtype=predictions.dtype, device=predictions.device),
         }
+
+        metrics = {key: value.detach() for key, value in raw_metrics.items()}
 
         if not self.keep_act_halting_head:
             outputs.pop("q_halt_logits", None)
