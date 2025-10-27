@@ -1482,7 +1482,9 @@ def launch(hydra_config: DictConfig):
         if progress_bar is not None:
             progress_bar.close()
         if log_path is not None:
-            generate_loss_plot(log_path, Path(config.log_dir), run_logger)
+            checkpoint_dir = _get_checkpoint_dir(config)
+            output_dir = checkpoint_dir if checkpoint_dir is not None else Path(config.log_dir)
+            generate_loss_plot(log_path, output_dir, run_logger)
 
     # finalize
     if dist.is_initialized():
