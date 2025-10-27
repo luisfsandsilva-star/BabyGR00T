@@ -1,4 +1,4 @@
-from typing import Optional, Any, Sequence, List, Dict
+from typing import Optional, Any, Sequence, List, Dict, Tuple, Literal
 from dataclasses import dataclass
 import os
 import math
@@ -46,6 +46,17 @@ class EvaluatorConfig(pydantic.BaseModel):
     name: str
 
 
+class CheckpointConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+
+    path: Optional[str] = None
+    resume: bool = False
+    resume_from: Optional[str] = None
+    monitor: str = "val/loss"
+    mode: Literal["min", "max"] = "min"
+    keep_last: Optional[int] = None
+
+
 class PretrainConfig(pydantic.BaseModel):
     # Config
     arch: ArchConfig
@@ -76,6 +87,7 @@ class PretrainConfig(pydantic.BaseModel):
     run_name: Optional[str] = None
     load_checkpoint: Optional[str] = None
     checkpoint_path: Optional[str] = None
+    checkpoint: CheckpointConfig = CheckpointConfig()
 
     # Extras
     seed: int = 0
@@ -92,6 +104,14 @@ class PretrainConfig(pydantic.BaseModel):
     use_wandb: bool = True
     log_dir: str = "logs"
     log_file: str = "pretrain.log"
+
+    @pydantic.model_validator(mode="after")
+    def _sync_checkpoint_config(self) -> "PretrainConfig":
+        if self.checkpoint.path is None and self.checkpoint_path is not None:
+            object.__setattr__(self.checkpoint, "path", self.checkpoint_path)
+        if self.checkpoint.resume_from is None and self.load_checkpoint is not None:
+            object.__setattr__(self.checkpoint, "resume_from", self.load_checkpoint)
+        return self
 
 
 
@@ -286,6 +306,11 @@ class TrainState:
 
     step: int
     total_steps: int
+    epoch: int = 0
+    best_val_loss: Optional[float] = None
+    schedulers: Sequence[Any] = ()
+    scheduler_states: Optional[Sequence[Dict[str, Any]]] = None
+    ema_state: Optional[Dict[str, Any]] = None
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
@@ -307,7 +332,14 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     return dataloader, dataset.metadata
 
 
-def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+def create_model(
+    config: PretrainConfig,
+    train_metadata: PuzzleDatasetMetadata,
+    rank: int,
+    world_size: int,
+    *,
+    model_state: Optional[Dict[str, Any]] = None,
+):
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
         batch_size=config.global_batch_size // world_size,
@@ -350,9 +382,24 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model)  # type: ignore
 
-        # Load checkpoint
-        if rank == 0:
-            load_checkpoint(model, config)
+        # Load model weights if provided
+        if model_state is not None and rank == 0:
+            print("Loading model weights from checkpoint")
+            puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
+            expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
+            if puzzle_emb_name in model_state:
+                puzzle_emb = model_state[puzzle_emb_name]
+                if puzzle_emb.shape != expected_shape:
+                    print(
+                        "Resetting puzzle embedding as shape is different. "
+                        f"Found {puzzle_emb.shape}, Expected {expected_shape}"
+                    )
+                    model_state[puzzle_emb_name] = (
+                        torch.mean(puzzle_emb, dim=0, keepdim=True)
+                        .expand(expected_shape)
+                        .contiguous()
+                    )
+            model.load_state_dict(model_state, assign=True)
 
         # Broadcast parameters from rank 0
         if world_size > 1:
@@ -430,52 +477,223 @@ def cosine_schedule_with_warmup_lr_lambda(
     return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
 
 
-def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+def init_train_state(
+    config: PretrainConfig,
+    train_metadata: PuzzleDatasetMetadata,
+    rank: int,
+    world_size: int,
+    *,
+    model_state: Optional[Dict[str, Any]] = None,
+    optimizer_states: Optional[Sequence[Dict[str, Any]]] = None,
+    scheduler_states: Optional[Sequence[Dict[str, Any]]] = None,
+    initial_step: int = 0,
+    initial_epoch: int = 0,
+    best_val_loss: Optional[float] = None,
+    ema_state: Optional[Dict[str, Any]] = None,
+):
     # Estimated total training steps
     total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
 
     # Model
-    model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)
+    model, optimizers, optimizer_lrs = create_model(
+        config,
+        train_metadata,
+        rank=rank,
+        world_size=world_size,
+        model_state=model_state,
+    )
+
+    if optimizer_states is not None:
+        for optimizer, state in zip(optimizers, optimizer_states):
+            optimizer.load_state_dict(state)
 
     return TrainState(
-        step=0,
+        step=initial_step,
         total_steps=total_steps,
 
         model=model,
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
-        carry=None
+        carry=None,
+        epoch=initial_epoch,
+        best_val_loss=best_val_loss,
+        scheduler_states=scheduler_states,
+        ema_state=ema_state,
     )
 
 
-def save_train_state(config: PretrainConfig, train_state: TrainState):
-    # FIXME: Only saved model.
-    if config.checkpoint_path is None:
+def _get_checkpoint_dir(config: PretrainConfig) -> Optional[Path]:
+    checkpoint_dir = config.checkpoint.path or config.checkpoint_path
+    if checkpoint_dir is None:
+        return None
+    return Path(checkpoint_dir)
+
+
+def _format_checkpoint_name(step: int) -> str:
+    return f"step_{step:08d}.ckpt"
+
+
+def _collect_scheduler_states(train_state: TrainState) -> Optional[List[Dict[str, Any]]]:
+    collected: List[Dict[str, Any]] = []
+    for scheduler in getattr(train_state, "schedulers", ()) or ():
+        state_dict = getattr(scheduler, "state_dict", None)
+        if callable(state_dict):
+            collected.append(state_dict())
+    if collected:
+        return collected
+    if train_state.scheduler_states is not None:
+        return list(train_state.scheduler_states)
+    return None
+
+
+def _get_monitor_value(metrics: Optional[Dict[str, Any]], monitor_key: Optional[str]) -> Optional[float]:
+    if metrics is None or monitor_key is None:
+        return None
+
+    flat_metrics = _flatten_metrics(metrics)
+    if monitor_key not in flat_metrics:
+        return None
+
+    return _maybe_to_number(flat_metrics[monitor_key])
+
+
+def _is_improvement(mode: str, current: Optional[float], best: Optional[float]) -> bool:
+    if current is None:
+        return False
+
+    if math.isnan(current):
+        return False
+
+    if best is None or math.isnan(best):
+        return True
+
+    normalized_mode = mode.lower()
+    if normalized_mode == "max":
+        return current > best
+
+    return current < best
+
+
+def save_train_state(
+    config: PretrainConfig,
+    train_state: TrainState,
+    *,
+    monitor_value: Optional[float] = None,
+    is_best: bool = False,
+    ema_state: Optional[Dict[str, Any]] = None,
+):
+    checkpoint_dir = _get_checkpoint_dir(config)
+    if checkpoint_dir is None:
         return
 
-    os.makedirs(config.checkpoint_path, exist_ok=True)
-    torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    optimizer_states = [optimizer.state_dict() for optimizer in train_state.optimizers]
+    scheduler_states = _collect_scheduler_states(train_state)
+    ema_payload = ema_state if ema_state is not None else train_state.ema_state
+
+    checkpoint_payload = {
+        "model_state": train_state.model.state_dict(),
+        "optimizer_states": optimizer_states,
+        "scheduler_state": scheduler_states,
+        "step": train_state.step,
+        "epoch": train_state.epoch,
+        "best_val_loss": train_state.best_val_loss,
+        "monitor": config.checkpoint.monitor,
+        "monitor_value": monitor_value,
+        "ema_state": ema_payload,
+    }
+
+    step_filename = _format_checkpoint_name(train_state.step)
+    step_path = checkpoint_dir / step_filename
+    torch.save(checkpoint_payload, step_path)
+
+    # Track latest checkpoint for easy resume
+    latest_path = checkpoint_dir / "latest.txt"
+    latest_path.write_text(step_filename)
+
+    if is_best:
+        shutil.copyfile(step_path, checkpoint_dir / "best.ckpt")
+
+    # Maintain cascading checkpoints
+    keep_last = config.checkpoint.keep_last
+    if keep_last is not None and keep_last >= 0:
+        limit = max(keep_last, 1)
+        numbered = sorted(checkpoint_dir.glob("step_*.ckpt"))
+        if len(numbered) > limit:
+            remove = numbered[:-limit]
+        else:
+            remove = []
+        for old_path in remove:
+            old_path.unlink(missing_ok=True)
+
+    train_state.scheduler_states = scheduler_states
+    train_state.ema_state = ema_payload
 
 
-def load_checkpoint(model: nn.Module, config: PretrainConfig):
-    if config.load_checkpoint is not None:
-        print(f"Loading checkpoint {config.load_checkpoint}")
+def _resolve_checkpoint_path(config: PretrainConfig) -> Optional[Path]:
+    checkpoint_dir = _get_checkpoint_dir(config)
+    checkpoint_cfg = config.checkpoint
 
-        # Load state dict
-        state_dict = torch.load(config.load_checkpoint, map_location="cuda")
+    if checkpoint_cfg.resume_from is not None:
+        explicit_path = Path(checkpoint_cfg.resume_from)
+        if not explicit_path.is_absolute() and checkpoint_dir is not None:
+            explicit_path = checkpoint_dir / explicit_path
+        return explicit_path
 
-        # Resize and reset puzzle emb if needed
-        puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
-        expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
-        if puzzle_emb_name in state_dict:
-            puzzle_emb = state_dict[puzzle_emb_name]
-            if puzzle_emb.shape != expected_shape:
-                print(f"Resetting puzzle embedding as shape is different. Found {puzzle_emb.shape}, Expected {expected_shape}")
-                # Re-initialize using mean
-                state_dict[puzzle_emb_name] = (
-                    torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
-                )
-        model.load_state_dict(state_dict, assign=True)
+    if not checkpoint_cfg.resume:
+        return None
+
+    if checkpoint_dir is None:
+        return None
+
+    latest_file = checkpoint_dir / "latest.txt"
+    if latest_file.exists():
+        relative = latest_file.read_text().strip()
+        candidate = checkpoint_dir / relative
+        if candidate.exists():
+            return candidate
+
+    numbered = sorted(checkpoint_dir.glob("step_*.ckpt"))
+    if numbered:
+        return numbered[-1]
+
+    best_path = checkpoint_dir / "best.ckpt"
+    if best_path.exists():
+        return best_path
+
+    return None
+
+
+def load_checkpoint(config: PretrainConfig) -> Optional[Dict[str, Any]]:
+    checkpoint_path = _resolve_checkpoint_path(config)
+    if checkpoint_path is None:
+        return None
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint '{checkpoint_path}' does not exist.")
+
+    print(f"Loading checkpoint {checkpoint_path}")
+    map_location = "cuda" if torch.cuda.is_available() else torch.device("cpu")
+    raw_checkpoint = torch.load(checkpoint_path, map_location=map_location)
+
+    if isinstance(raw_checkpoint, dict) and "model_state" in raw_checkpoint:
+        checkpoint_payload = dict(raw_checkpoint)
+    else:
+        checkpoint_payload = {
+            "model_state": raw_checkpoint,
+            "optimizer_states": None,
+            "scheduler_state": None,
+            "step": 0,
+            "epoch": 0,
+            "best_val_loss": None,
+            "monitor": None,
+            "monitor_value": None,
+            "ema_state": None,
+        }
+
+    checkpoint_payload["checkpoint_path"] = str(checkpoint_path)
+    return checkpoint_payload
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
@@ -665,11 +883,12 @@ def evaluate(
         save_preds = {k: torch.cat(v, dim=0) for k, v in save_preds.items()}
 
         # Save preds
-        if config.checkpoint_path is not None and len(save_preds):
+        checkpoint_dir = _get_checkpoint_dir(config)
+        if checkpoint_dir is not None and len(save_preds):
             # Each rank save predictions independently
-            os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
             torch.save(
-                save_preds, os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}")
+                save_preds, checkpoint_dir / f"step_{train_state.step}_all_preds.{rank}"
             )
 
         del save_preds
@@ -704,12 +923,9 @@ def evaluate(
                 
             # Path for saving
             evaluator_save_path = None
-            if config.checkpoint_path is not None:
-                evaluator_save_path = os.path.join(
-                    config.checkpoint_path,
-                    f"evaluator_{evaluator.__class__.__name__}_step_{train_state.step}",
-                )
-                os.makedirs(evaluator_save_path, exist_ok=True)
+            if checkpoint_dir is not None:
+                evaluator_save_path = checkpoint_dir / f"evaluator_{evaluator.__class__.__name__}_step_{train_state.step}"
+                evaluator_save_path.mkdir(exist_ok=True)
 
             # Run and log
             metrics = evaluator.result(evaluator_save_path, rank=rank, world_size=world_size, group=cpu_group)
@@ -726,10 +942,11 @@ def evaluate(
     return reduced_metrics
 
 def save_code_and_config(config: PretrainConfig):
-    if config.checkpoint_path is None or wandb.run is None:
+    checkpoint_dir = _get_checkpoint_dir(config)
+    if checkpoint_dir is None or wandb.run is None:
         return
 
-    os.makedirs(config.checkpoint_path, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy code
     code_list = [
@@ -740,15 +957,15 @@ def save_code_and_config(config: PretrainConfig):
         if code_file is not None:
             code_name = os.path.basename(code_file)
 
-            shutil.copy(code_file, os.path.join(config.checkpoint_path, code_name))
+            shutil.copy(code_file, checkpoint_dir / code_name)
 
     # Dump config as yaml
-    config_file = os.path.join(config.checkpoint_path, "all_config.yaml")
+    config_file = checkpoint_dir / "all_config.yaml"
     with open(config_file, "wt") as f:
         yaml.dump(config.model_dump(), f)
 
     # Log code
-    wandb.run.log_code(config.checkpoint_path)
+    wandb.run.log_code(str(checkpoint_dir))
 
 
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> PretrainConfig:
@@ -761,8 +978,11 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
             config.project_name = f"{os.path.basename(config.data_paths[0]).capitalize()}-ACT-torch"
         if config.run_name is None:
             config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
-        if config.checkpoint_path is None:
-            config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
+        checkpoint_dir = config.checkpoint.path or config.checkpoint_path
+        if checkpoint_dir is None:
+            checkpoint_dir = os.path.join("checkpoints", config.project_name, config.run_name)
+        config.checkpoint_path = checkpoint_dir
+        object.__setattr__(config.checkpoint, "path", checkpoint_dir)
 
         objects = [config]
 
@@ -848,13 +1068,52 @@ def launch(hydra_config: DictConfig):
         evaluators = []
 
     # Train state
-    train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
+    checkpoint_payload = None
+    if RANK == 0:
+        checkpoint_payload = load_checkpoint(config)
+
+    if WORLD_SIZE > 1:
+        shared_payload: List[Any] = [checkpoint_payload]
+        dist.broadcast_object_list(shared_payload, src=0)
+        checkpoint_payload = shared_payload[0]
+
+    model_state = None
+    optimizer_states = None
+    scheduler_states = None
+    initial_step = 0
+    initial_epoch = 0
+    best_val_loss = None
+    ema_state = None
+
+    if checkpoint_payload is not None:
+        model_state = checkpoint_payload.get("model_state")
+        if config.checkpoint.resume:
+            optimizer_states = checkpoint_payload.get("optimizer_states")
+            scheduler_states = checkpoint_payload.get("scheduler_state")
+            initial_step = int(checkpoint_payload.get("step", 0) or 0)
+            initial_epoch = int(checkpoint_payload.get("epoch", 0) or 0)
+            best_val_loss = checkpoint_payload.get("best_val_loss")
+            ema_state = checkpoint_payload.get("ema_state")
+
+    train_state = init_train_state(
+        config,
+        train_metadata,
+        rank=RANK,
+        world_size=WORLD_SIZE,
+        model_state=model_state,
+        optimizer_states=optimizer_states,
+        scheduler_states=scheduler_states,
+        initial_step=initial_step,
+        initial_epoch=initial_epoch,
+        best_val_loss=best_val_loss,
+        ema_state=ema_state,
+    )
 
     # Progress bar and logger
     progress_bar: Optional[tqdm.tqdm] = None
     ema_helper = None
     if RANK == 0:
-        progress_bar = tqdm.tqdm(total=train_state.total_steps)
+        progress_bar = tqdm.tqdm(total=train_state.total_steps, initial=train_state.step)
         num_params = sum(x.numel() for x in train_state.model.parameters())
         if run_logger is not None:
             run_logger.info("MODEL num_params=%d", num_params)
@@ -878,9 +1137,27 @@ def launch(hydra_config: DictConfig):
         print('Setup EMA')
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
+        if train_state.ema_state is not None:
+            ema_helper.load_state_dict(train_state.ema_state)
 
     # Training Loop
-    for _iter_id in range(total_iters):
+    start_iter = 0
+    if train_epochs_per_iter > 0:
+        start_iter = train_state.epoch // train_epochs_per_iter
+
+    if start_iter:
+        resumed_from = checkpoint_payload.get("checkpoint_path") if checkpoint_payload else None
+        resume_message = (
+            f"Resuming training from step {train_state.step} epoch {train_state.epoch}"
+            + (f" using {resumed_from}" if resumed_from else "")
+        )
+        if RANK == 0:
+            if run_logger is not None:
+                run_logger.info(resume_message)
+            if not config.use_wandb:
+                print(resume_message)
+
+    for _iter_id in range(start_iter, total_iters):
         epoch_num = _iter_id + 1
         global_epoch = _iter_id * train_epochs_per_iter
         print(f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {global_epoch}")
@@ -916,6 +1193,8 @@ def launch(hydra_config: DictConfig):
             if config.ema:
                 ema_helper.update(train_state.model)
 
+        monitor_value: Optional[float] = None
+
         if _iter_id >= config.min_eval_interval:
             metrics = None
             if RANK == 0:
@@ -945,6 +1224,7 @@ def launch(hydra_config: DictConfig):
                     else:
                         _log_metrics(run_logger, f"VAL step={train_state.step}", metrics, print_to_console=True)
                     epoch_val_loss = _extract_validation_loss(metrics)
+                monitor_value = _get_monitor_value(metrics, config.checkpoint.monitor)
             else:
                 if RANK == 0:
                     skip_msg = "Skipping evaluation because no evaluation loader is available."
@@ -957,10 +1237,25 @@ def launch(hydra_config: DictConfig):
             if RANK == 0:
                 print("SAVE CHECKPOINT")
             if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
-                save_train_state(config, train_state_eval)
+                ema_state = ema_helper.state_dict() if config.ema else None
+                improved = False
+                if config.checkpoint.monitor is not None:
+                    if _is_improvement(config.checkpoint.mode, monitor_value, train_state.best_val_loss):
+                        train_state.best_val_loss = monitor_value
+                        improved = monitor_value is not None
+                save_train_state(
+                    config,
+                    train_state,
+                    monitor_value=monitor_value,
+                    is_best=improved,
+                    ema_state=ema_state,
+                )
 
             if config.ema:
                 del train_state_eval
+
+        # Update the current epoch counter after each iteration
+        train_state.epoch = (_iter_id + 1) * train_epochs_per_iter
 
         if RANK == 0:
             train_loss_avg = sum(epoch_train_losses) / len(epoch_train_losses) if epoch_train_losses else None
