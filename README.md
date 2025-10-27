@@ -35,7 +35,7 @@ wandb login YOUR-LOGIN # login if you want the logger to sync results to your We
 - The pretraining script now exposes a `use_wandb` flag (enabled by default) plus `log_dir`/`log_file` paths in `config/cfg_pretrain.yaml`. Override them from the command line with Hydra, for example `python pretrain.py use_wandb=false log_dir=logs/run_01`.
 - When `use_wandb=true`, training behaves as before and syncs metrics to the configured W&B project/run.
 - When `use_wandb=false`, W&B calls are skipped. Metrics for each step are printed to the console and appended to `<log_dir>/<log_file>` (defaults to `logs/pretrain.log`).
-- At the end of every run a `train_vs_val_loss.png` figure is generated next to the log file. Both the `.log` file and the plot accumulate all epoch summaries (`train_loss`/`val_loss`) so you can inspect learning progress without W&B.
+- At the end of every run a `train_vs_val_loss.png` figure is generated next to the checkpoint files (falling back to the log directory when checkpoints are disabled). Both the `.log` file and the plot accumulate all epoch summaries (`train_loss`/`val_loss`) so you can inspect learning progress without W&B.
 - By default the trainer runs a quick sanity check on the first batch of every split (train/eval) to validate shapes, dtypes and NaN/inf issues. Disable it with `skip_sanity_checks=true` if you need to speed up start-up (e.g. when debugging custom loaders).
 
 ### Checkpointing & resuming training
