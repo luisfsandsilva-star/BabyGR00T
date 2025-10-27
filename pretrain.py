@@ -1,4 +1,4 @@
-from typing import Optional, Any, Sequence, List
+from typing import Optional, Any, Sequence, List, Dict
 from dataclasses import dataclass
 import os
 import math
@@ -6,6 +6,10 @@ import yaml
 import shutil
 import copy
 import inspect
+import logging
+import re
+from pathlib import Path
+from numbers import Number
 
 import torch
 import torch.distributed as dist
@@ -83,6 +87,195 @@ class PretrainConfig(pydantic.BaseModel):
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
+
+    # Logging
+    use_wandb: bool = True
+    log_dir: str = "logs"
+    log_file: str = "pretrain.log"
+
+
+
+def setup_file_logger(log_path: Path) -> logging.Logger:
+    logger = logging.getLogger("pretrain_run")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+    file_handler = logging.FileHandler(log_path, mode="a")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+
+def _maybe_to_number(value: Any) -> Optional[float]:
+    if isinstance(value, Number):
+        return float(value)
+
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return float(item())
+        except Exception:
+            return None
+
+    return None
+
+
+
+def _flatten_metrics(metrics: Dict[str, Any], parent_key: str = "") -> Dict[str, Any]:
+    items: Dict[str, Any] = {}
+    for key, value in metrics.items():
+        new_key = f"{parent_key}/{key}" if parent_key else str(key)
+        if isinstance(value, dict):
+            items.update(_flatten_metrics(value, new_key))
+        else:
+            items[new_key] = value
+    return items
+
+
+
+def _format_metrics_string(metrics: Dict[str, Any]) -> str:
+    flat_metrics = _flatten_metrics(metrics)
+    parts = []
+    for key in sorted(flat_metrics.keys()):
+        value = flat_metrics[key]
+        numeric = _maybe_to_number(value)
+        if numeric is None:
+            parts.append(f"{key}={value}")
+        else:
+            if math.isnan(numeric) or math.isinf(numeric):
+                parts.append(f"{key}={numeric}")
+            else:
+                parts.append(f"{key}={numeric:.6f}")
+    return ", ".join(parts)
+
+
+
+def _log_metrics(
+    logger: Optional[logging.Logger],
+    label: str,
+    metrics: Optional[Dict[str, Any]],
+    print_to_console: bool = False,
+) -> None:
+    if metrics is None:
+        return
+
+    formatted = _format_metrics_string(metrics)
+    message = f"{label}: {formatted}"
+
+    if logger is not None:
+        logger.info(message)
+    if print_to_console:
+        print(message)
+
+
+
+def _extract_validation_loss(metrics: Optional[Dict[str, Any]]) -> Optional[float]:
+    if metrics is None:
+        return None
+
+    flat_metrics = _flatten_metrics(metrics)
+    losses = []
+    for key, value in flat_metrics.items():
+        metric_name = key.split("/")[-1]
+        if metric_name.endswith("loss") and not key.startswith("train/"):
+            numeric = _maybe_to_number(value)
+            if numeric is not None:
+                losses.append(numeric)
+
+    if losses:
+        return sum(losses) / len(losses)
+    return None
+
+
+
+def generate_loss_plot(log_path: Path, output_dir: Path, logger: Optional[logging.Logger] = None) -> None:
+    if not log_path.exists():
+        return
+
+    summary_pattern = re.compile(
+        r"EPOCH_SUMMARY epoch=(?P<epoch>\d+) train_loss=(?P<train>[-+\deE\.NA]+) val_loss=(?P<val>[-+\deE\.NA]+)"
+    )
+
+    epochs: List[int] = []
+    train_losses: List[Optional[float]] = []
+    val_losses: List[Optional[float]] = []
+
+    try:
+        with log_path.open("r", encoding="utf-8") as log_file:
+            for line in log_file:
+                match = summary_pattern.search(line)
+                if match is None:
+                    continue
+
+                epoch = int(match.group("epoch"))
+
+                def _safe_parse(value: str) -> Optional[float]:
+                    if value.upper() == "NA":
+                        return None
+                    try:
+                        parsed = float(value)
+                    except ValueError:
+                        return None
+                    if math.isnan(parsed) or math.isinf(parsed):
+                        return None
+                    return parsed
+
+                epochs.append(epoch)
+                train_losses.append(_safe_parse(match.group("train")))
+                val_losses.append(_safe_parse(match.group("val")))
+    except FileNotFoundError:
+        return
+
+    if not epochs:
+        return
+
+    has_train = any(value is not None for value in train_losses)
+    has_val = any(value is not None for value in val_losses)
+
+    if not has_train and not has_val:
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover - matplotlib might be unavailable in tests
+        message = f"Unable to create loss plot: {exc}"
+        if logger is not None:
+            logger.warning(message)
+        else:
+            print(message)
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    figure_path = output_dir / "train_vs_val_loss.png"
+
+    def _to_series(values: List[Optional[float]]) -> List[float]:
+        return [value if value is not None else math.nan for value in values]
+
+    plt.figure(figsize=(8, 5))
+    if has_train:
+        plt.plot(epochs, _to_series(train_losses), label="train_loss", marker="o")
+    if has_val:
+        plt.plot(epochs, _to_series(val_losses), label="val_loss", marker="o")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training vs Validation Loss")
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(figure_path, dpi=200)
+    plt.close()
+
+    if logger is not None:
+        logger.info("LOSS_PLOT_SAVED path=%s", figure_path)
+    else:
+        print(f"Saved loss plot to {figure_path}")
+
 
 @dataclass
 class TrainState:
@@ -579,6 +772,7 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
     return objects[0]  # type: ignore
 
 
+
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
     RANK = 0
@@ -594,7 +788,7 @@ def launch(hydra_config: DictConfig):
         WORLD_SIZE = dist.get_world_size()
 
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        
+
         # CPU GLOO process group
         CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
         assert (
@@ -607,22 +801,49 @@ def launch(hydra_config: DictConfig):
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
 
+    log_dir_path: Optional[Path] = None
+    log_path: Optional[Path] = None
+    run_logger: Optional[logging.Logger] = None
+    if RANK == 0:
+        log_dir_path = Path(config.log_dir).expanduser()
+        log_dir_path.mkdir(parents=True, exist_ok=True)
+        config.log_dir = str(log_dir_path.resolve())
+        log_path = log_dir_path / config.log_file
+        run_logger = setup_file_logger(log_path)
+        run_logger.info("LOGGING_INITIALIZED log_path=%s", log_path)
+
     # Dataset
     train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
     total_iters = config.epochs // train_epochs_per_iter
 
     assert config.epochs % train_epochs_per_iter == 0, "Eval interval must be a divisor of total epochs."
 
-    train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+    train_loader, train_metadata = create_dataloader(
+        config,
+        "train",
+        test_set_mode=False,
+        epochs_per_iter=train_epochs_per_iter,
+        global_batch_size=config.global_batch_size,
+        rank=RANK,
+        world_size=WORLD_SIZE,
+    )
     try:
-        eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
-    except:
+        eval_loader, eval_metadata = create_dataloader(
+            config,
+            "test",
+            test_set_mode=True,
+            epochs_per_iter=1,
+            global_batch_size=config.global_batch_size,
+            rank=RANK,
+            world_size=WORLD_SIZE,
+        )
+    except Exception:
         print("NO EVAL DATA FOUND")
         eval_loader = eval_metadata = None
 
     try:
         evaluators = create_evaluators(config, eval_metadata)
-    except:
+    except Exception:
         print("No evaluator found")
         evaluators = []
 
@@ -630,13 +851,29 @@ def launch(hydra_config: DictConfig):
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
 
     # Progress bar and logger
-    progress_bar = None
+    progress_bar: Optional[tqdm.tqdm] = None
     ema_helper = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
-        wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
-        save_code_and_config(config)
+        num_params = sum(x.numel() for x in train_state.model.parameters())
+        if run_logger is not None:
+            run_logger.info("MODEL num_params=%d", num_params)
+        if config.use_wandb:
+            wandb.init(
+                project=config.project_name,
+                name=config.run_name,
+                config=config.model_dump(),
+                settings=wandb.Settings(_disable_stats=True),
+            )  # type: ignore
+            wandb.log({"num_params": num_params}, step=0)
+            save_code_and_config(config)
+        else:
+            info_message = f"W&B disabled. Logging metrics to {log_path}" if log_path is not None else "W&B disabled."
+            print(info_message)
+            if run_logger is not None:
+                run_logger.info(info_message)
+            print(f"Model parameters: {num_params}")
+
     if config.ema:
         print('Setup EMA')
         ema_helper = EMAHelper(mu=config.ema_rate)
@@ -644,7 +881,20 @@ def launch(hydra_config: DictConfig):
 
     # Training Loop
     for _iter_id in range(total_iters):
-        print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
+        epoch_num = _iter_id + 1
+        global_epoch = _iter_id * train_epochs_per_iter
+        print(f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {global_epoch}")
+
+        epoch_train_losses: List[float] = []
+        epoch_val_loss: Optional[float] = None
+
+        if RANK == 0:
+            if run_logger is not None:
+                run_logger.info("EPOCH_START epoch=%d global_epoch=%d", epoch_num, global_epoch)
+            if not config.use_wandb:
+                print(f"EPOCH_START epoch={epoch_num} global_epoch={global_epoch}")
+            if progress_bar is not None:
+                progress_bar.set_description(f"Epoch {epoch_num}/{total_iters}")
 
         ############ Train Iter
         if RANK == 0:
@@ -654,13 +904,20 @@ def launch(hydra_config: DictConfig):
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
-                progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                if config.use_wandb:
+                    wandb.log(metrics, step=train_state.step)
+                else:
+                    _log_metrics(run_logger, f"TRAIN step={train_state.step}", metrics, print_to_console=True)
+                if progress_bar is not None:
+                    progress_bar.update(train_state.step - progress_bar.n)
+                train_loss_val = _maybe_to_number(metrics.get("train/loss")) if isinstance(metrics, dict) else None
+                if train_loss_val is not None:
+                    epoch_train_losses.append(train_loss_val)
             if config.ema:
                 ema_helper.update(train_state.model)
 
         if _iter_id >= config.min_eval_interval:
-            ############ Evaluation
+            metrics = None
             if RANK == 0:
                 print("EVALUATE")
             if config.ema:
@@ -670,18 +927,32 @@ def launch(hydra_config: DictConfig):
             else:
                 train_state_eval = train_state
             train_state_eval.model.eval()
-            metrics = evaluate(config, 
-                train_state_eval, 
-                eval_loader, 
-                eval_metadata, 
-                evaluators,
-                rank=RANK, 
-                world_size=WORLD_SIZE,
-                cpu_group=CPU_PROCESS_GROUP)
 
-            if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
-                
+            if eval_loader is not None and eval_metadata is not None:
+                metrics = evaluate(
+                    config,
+                    train_state_eval,
+                    eval_loader,
+                    eval_metadata,
+                    evaluators,
+                    rank=RANK,
+                    world_size=WORLD_SIZE,
+                    cpu_group=CPU_PROCESS_GROUP,
+                )
+                if RANK == 0 and metrics is not None:
+                    if config.use_wandb:
+                        wandb.log(metrics, step=train_state.step)
+                    else:
+                        _log_metrics(run_logger, f"VAL step={train_state.step}", metrics, print_to_console=True)
+                    epoch_val_loss = _extract_validation_loss(metrics)
+            else:
+                if RANK == 0:
+                    skip_msg = "Skipping evaluation because no evaluation loader is available."
+                    if run_logger is not None:
+                        run_logger.info(skip_msg)
+                    if not config.use_wandb:
+                        print(skip_msg)
+
             ############ Checkpointing
             if RANK == 0:
                 print("SAVE CHECKPOINT")
@@ -691,10 +962,29 @@ def launch(hydra_config: DictConfig):
             if config.ema:
                 del train_state_eval
 
+        if RANK == 0:
+            train_loss_avg = sum(epoch_train_losses) / len(epoch_train_losses) if epoch_train_losses else None
+            train_loss_str = f"{train_loss_avg:.6f}" if train_loss_avg is not None else "NA"
+            val_loss_str = f"{epoch_val_loss:.6f}" if epoch_val_loss is not None else "NA"
+            summary_message = f"EPOCH_SUMMARY epoch={epoch_num} train_loss={train_loss_str} val_loss={val_loss_str}"
+            if run_logger is not None:
+                run_logger.info(summary_message)
+            if not config.use_wandb:
+                print(summary_message)
+            if progress_bar is not None:
+                progress_bar.set_postfix_str(f"train_loss={train_loss_str} val_loss={val_loss_str}")
+
+    if RANK == 0:
+        if progress_bar is not None:
+            progress_bar.close()
+        if log_path is not None:
+            generate_loss_plot(log_path, Path(config.log_dir), run_logger)
+
     # finalize
     if dist.is_initialized():
         dist.destroy_process_group()
-    wandb.finish()
+    if config.use_wandb and wandb.run is not None:
+        wandb.finish()
 
 
 if __name__ == "__main__":
