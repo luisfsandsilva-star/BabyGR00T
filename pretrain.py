@@ -365,6 +365,29 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics["train/lr"] = lr_this_step
             return reduced_metrics
 
+def _resolve_eval_set_names(eval_loader: DataLoader, eval_metadata: PuzzleDatasetMetadata) -> List[str]:
+    """Return the ordered list of set names yielded by ``eval_loader``.
+
+    When multiple dataset paths share the same base set name the loader appends
+    an integer suffix (e.g. ``episodes1``) to keep them distinct.  The metadata
+    still only tracks the base names, which causes evaluation to fail when it
+    looks up metrics by the suffixed key.  We inspect the loader to retrieve the
+    actual keys populated in ``PuzzleDataset._data`` and fall back to the
+    metadata when that information is unavailable (e.g. for custom loaders).
+    """
+
+    dataset = getattr(eval_loader, "dataset", None)
+    if dataset is not None:
+        lazy_loader = getattr(dataset, "_lazy_load_dataset", None)
+        if callable(lazy_loader):
+            lazy_loader()
+        data = getattr(dataset, "_data", None)
+        if isinstance(data, dict) and len(data):
+            return list(data.keys())
+
+    return list(eval_metadata.sets)
+
+
 def evaluate(
     config: PretrainConfig,
     train_state: TrainState,
@@ -384,7 +407,8 @@ def evaluate(
             return_keys.update(evaluator.required_outputs)
 
         # Run evaluation
-        set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
+        set_names = _resolve_eval_set_names(eval_loader, eval_metadata)
+        set_ids = {k: idx for idx, k in enumerate(set_names)}
 
         save_preds = {}
 
@@ -437,7 +461,7 @@ def evaluate(
                     sorted(metrics.keys())
                 )  # Sort keys to guarantee all processes use the same order.
                 metric_values = torch.zeros(
-                    (len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda"
+                    (len(set_names), len(metrics.values())), dtype=torch.float32, device="cuda"
                 )
 
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
@@ -469,7 +493,7 @@ def evaluate(
                         metric_name: reduced_metrics[set_id, metric_id]
                         for metric_id, metric_name in enumerate(metric_keys)
                     }
-                    for set_id, set_name in enumerate(set_ids)
+                    for set_id, set_name in enumerate(set_names)
                 }
 
                 # Postprocess
