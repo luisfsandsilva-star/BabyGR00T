@@ -53,3 +53,4 @@ freeze_weights: False # If True, freeze weights and only learn the embeddings
 use_wandb: True
 log_dir: logs
 log_file: pretrain.log
+skip_sanity_checks: false

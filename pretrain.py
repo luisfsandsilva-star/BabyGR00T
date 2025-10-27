@@ -104,6 +104,7 @@ class PretrainConfig(pydantic.BaseModel):
     use_wandb: bool = True
     log_dir: str = "logs"
     log_file: str = "pretrain.log"
+    skip_sanity_checks: bool = False
 
     @pydantic.model_validator(mode="after")
     def _sync_checkpoint_config(self) -> "PretrainConfig":
@@ -193,6 +194,169 @@ def _log_metrics(
     if print_to_console:
         print(message)
 
+
+
+def _dataset_total_examples(loader: DataLoader) -> Optional[int]:
+    dataset = getattr(loader, "dataset", None)
+    if dataset is None:
+        return None
+
+    lazy_loader = getattr(dataset, "_lazy_load_dataset", None)
+    if callable(lazy_loader):
+        lazy_loader()
+
+    data = getattr(dataset, "_data", None)
+    if not isinstance(data, dict) or not data:
+        return None
+
+    total = 0
+    for set_data in data.values():
+        if isinstance(set_data, dict) and "inputs" in set_data:
+            inputs = set_data["inputs"]
+            try:
+                total += int(len(inputs))
+            except Exception:
+                size = getattr(inputs, "shape", None)
+                if isinstance(size, tuple) and size:
+                    total += int(size[0])
+    return total
+
+
+def _validate_tensor(
+    *,
+    name: str,
+    tensor: torch.Tensor,
+    expected_dtype: Optional[torch.dtype] = None,
+    expected_last_dim: Optional[int] = None,
+) -> Dict[str, Any]:
+    if expected_dtype is not None and tensor.dtype != expected_dtype:
+        raise TypeError(
+            f"Expected {name} dtype {expected_dtype} but found {tensor.dtype}."
+        )
+
+    if expected_last_dim is not None and tensor.ndim >= 1:
+        if tensor.shape[-1] != expected_last_dim:
+            raise ValueError(
+                f"Expected {name} last dimension {expected_last_dim} but found {tensor.shape[-1]}."
+            )
+
+    finite = True
+    if tensor.is_floating_point():
+        finite = bool(torch.isfinite(tensor).all().item())
+        if not finite:
+            raise ValueError(f"Tensor '{name}' contains NaN or inf values.")
+
+    return {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "finite": finite,
+    }
+
+
+def _run_dataloader_sanity_checks(
+    *,
+    loader: DataLoader,
+    metadata: PuzzleDatasetMetadata,
+    loader_name: str,
+    rank: int,
+    expected_batch_size: Optional[int],
+) -> None:
+    dataset = getattr(loader, "dataset", None)
+    if dataset is None:
+        raise RuntimeError(f"{loader_name} loader does not expose a dataset instance.")
+
+    if metadata.total_groups <= 0:
+        raise RuntimeError(
+            f"{loader_name} metadata reports no groups (total_groups={metadata.total_groups})."
+        )
+
+    total_examples = _dataset_total_examples(loader)
+    if total_examples is None or total_examples <= 0:
+        raise RuntimeError(
+            f"{loader_name} dataset does not contain any examples (total_examples={total_examples})."
+        )
+
+    data = getattr(dataset, "_data", None)
+    if isinstance(data, dict) and metadata.sets:
+        missing_sets = [set_name for set_name in metadata.sets if set_name not in data]
+        if missing_sets:
+            raise RuntimeError(
+                f"{loader_name} dataset is missing splits listed in metadata: {missing_sets}."
+            )
+
+    iterator = iter(loader)
+    try:
+        set_name, batch, global_batch_size = next(iterator)
+    except StopIteration as exc:
+        raise RuntimeError(f"{loader_name} loader returned no batches for sanity checks.") from exc
+
+    if "inputs" not in batch:
+        raise RuntimeError(f"{loader_name} batch is missing required 'inputs' tensor.")
+
+    inputs = batch["inputs"]
+    batch_size = inputs.shape[0]
+    if expected_batch_size is not None and batch_size != expected_batch_size:
+        raise RuntimeError(
+            f"{loader_name} batch size mismatch: expected {expected_batch_size}, found {batch_size}."
+        )
+
+    expected_inputs_dtype = torch.float32 if metadata.task_type == "regression" else torch.int32
+    summary: Dict[str, Any] = {
+        "set_name": set_name,
+        "global_batch_size": int(global_batch_size),
+        "inputs": _validate_tensor(
+            name="inputs",
+            tensor=inputs,
+            expected_dtype=expected_inputs_dtype,
+            expected_last_dim=metadata.input_dim,
+        ),
+    }
+
+    targets = batch.get("targets")
+    if targets is not None:
+        summary["targets"] = _validate_tensor(
+            name="targets",
+            tensor=targets,
+            expected_dtype=torch.float32,
+            expected_last_dim=metadata.target_dim,
+        )
+    else:
+        if metadata.task_type == "regression":
+            raise RuntimeError(f"{loader_name} batch is missing required 'targets' tensor.")
+        summary["targets"] = "missing"
+
+    target_mask = batch.get("target_mask")
+    if target_mask is not None:
+        summary["target_mask"] = _validate_tensor(
+            name="target_mask",
+            tensor=target_mask,
+            expected_dtype=torch.bool,
+            expected_last_dim=metadata.target_dim,
+        )
+        if targets is not None and target_mask.shape != targets.shape:
+            raise ValueError(
+                f"{loader_name} target_mask shape {tuple(target_mask.shape)} does not match targets {tuple(targets.shape)}."
+            )
+    else:
+        if metadata.task_type == "regression":
+            raise RuntimeError(f"{loader_name} batch is missing required 'target_mask' tensor.")
+        summary["target_mask"] = "missing"
+
+    if rank == 0:
+        print(f"[Sanity Check] {loader_name} loader preview:")
+        print(f"  set='{summary['set_name']}', global_batch_size={summary['global_batch_size']}")
+
+        def _fmt_entry(value: Any) -> str:
+            if isinstance(value, dict):
+                finite = value.get("finite")
+                finite_str = "finite" if finite else "non-finite"
+                return (
+                    f"shape={value.get('shape')}, dtype={value.get('dtype')}, {finite_str}"
+                )
+            return str(value)
+
+        for key in ("inputs", "targets", "target_mask"):
+            print(f"  {key}: {_fmt_entry(summary[key])}")
 
 
 def _extract_validation_loss(metrics: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -1047,8 +1211,31 @@ def launch(hydra_config: DictConfig):
         rank=RANK,
         world_size=WORLD_SIZE,
     )
+
+    if not config.skip_sanity_checks:
+        train_dataset = getattr(train_loader, "dataset", None)
+        expected_local_batch = getattr(train_dataset, "local_batch_size", None)
+        _run_dataloader_sanity_checks(
+            loader=train_loader,
+            metadata=train_metadata,
+            loader_name="train",
+            rank=RANK,
+            expected_batch_size=expected_local_batch,
+        )
+        train_loader, train_metadata = create_dataloader(
+            config,
+            "train",
+            test_set_mode=False,
+            epochs_per_iter=train_epochs_per_iter,
+            global_batch_size=config.global_batch_size,
+            rank=RANK,
+            world_size=WORLD_SIZE,
+        )
+
+    eval_loader = None
+    eval_metadata = None
     try:
-        eval_loader, eval_metadata = create_dataloader(
+        potential_eval_loader, potential_eval_metadata = create_dataloader(
             config,
             "test",
             test_set_mode=True,
@@ -1059,7 +1246,29 @@ def launch(hydra_config: DictConfig):
         )
     except Exception:
         print("NO EVAL DATA FOUND")
-        eval_loader = eval_metadata = None
+    else:
+        if not config.skip_sanity_checks:
+            eval_dataset = getattr(potential_eval_loader, "dataset", None)
+            expected_eval_batch = getattr(eval_dataset, "local_batch_size", None)
+            _run_dataloader_sanity_checks(
+                loader=potential_eval_loader,
+                metadata=potential_eval_metadata,
+                loader_name="eval",
+                rank=RANK,
+                expected_batch_size=expected_eval_batch,
+            )
+            potential_eval_loader, potential_eval_metadata = create_dataloader(
+                config,
+                "test",
+                test_set_mode=True,
+                epochs_per_iter=1,
+                global_batch_size=config.global_batch_size,
+                rank=RANK,
+                world_size=WORLD_SIZE,
+            )
+
+        eval_loader = potential_eval_loader
+        eval_metadata = potential_eval_metadata
 
     try:
         evaluators = create_evaluators(config, eval_metadata)
