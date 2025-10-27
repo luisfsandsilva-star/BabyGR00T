@@ -5,6 +5,7 @@ import math
 import yaml
 import shutil
 import copy
+import inspect
 
 import torch
 import torch.distributed as dist
@@ -131,11 +132,28 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     # Instantiate model with loss head
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
+    loss_kwargs = dict(getattr(config.arch.loss, "__pydantic_extra__", {}) or {})
+
+    try:
+        loss_init_sig = inspect.signature(loss_head_cls.__init__)
+    except (TypeError, ValueError):
+        pass
+    else:
+        accepts_var_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in loss_init_sig.parameters.values()
+        )
+        if not accepts_var_kwargs:
+            allowed_params = {
+                name
+                for name, param in loss_init_sig.parameters.items()
+                if name != "self" and param.kind != inspect.Parameter.VAR_POSITIONAL
+            }
+            loss_kwargs = {k: v for k, v in loss_kwargs.items() if k in allowed_params}
 
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
         print(model)
-        model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+        model = loss_head_cls(model, **loss_kwargs)  # type: ignore
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model)  # type: ignore
 
