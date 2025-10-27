@@ -37,6 +37,14 @@ wandb login YOUR-LOGIN # login if you want the logger to sync results to your We
 - When `use_wandb=false`, W&B calls are skipped. Metrics for each step are printed to the console and appended to `<log_dir>/<log_file>` (defaults to `logs/pretrain.log`).
 - At the end of every run a `train_vs_val_loss.png` figure is generated next to the log file. Both the `.log` file and the plot accumulate all epoch summaries (`train_loss`/`val_loss`) so you can inspect learning progress without W&B.
 
+### Checkpointing & resuming training
+
+- All checkpoints live under `checkpoint.path` (defaults to `checkpoints/<project>/<run>`). Each evaluation step writes a numbered file (`step_00000010.ckpt`) plus an updated `latest.txt` pointer. The best checkpoint according to `checkpoint.monitor` is mirrored to `best.ckpt`.
+- Set `checkpoint.monitor` (default `val/loss`) and `checkpoint.mode` (`min` or `max`) to control which validation metric defines “best”. The monitor string is matched against the flattened validation metrics (`val/regression_loss`, `eval/arc/accuracy`, …).
+- Use `checkpoint.keep_last=<N>` to keep only the most recent `N` step checkpoints while still retaining `best.ckpt`. Leave it as `null` to keep the full history.
+- To resume, point Hydra to the directory and flip `checkpoint.resume=true`. By default the trainer reloads `latest.txt`. Override the exact file with `checkpoint.resume_from=path/to/checkpoint.ckpt`.
+- Resuming restores the model weights, every optimizer in the stack, tracked schedulers, the EMA shadow weights (when enabled), and the training counters (`step`, `epoch`, `best_val_loss`). Training picks up at the next evaluation window using the restored learning-rate schedule and progress bar state.
+
 ### Dataset Preparation
 
 ```bash
