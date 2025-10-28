@@ -42,10 +42,10 @@ def test_save_checkpoint_records_optimizer_and_best(tmp_path):
         step=12,
         total_steps=100,
         epoch=5,
-        best_val_loss=0.5,
+        best_val_metric=0.5,
     )
 
-    train_state.best_val_loss = 0.4
+    train_state.best_val_metric = 0.4
 
     ema_state = {"weight": torch.ones_like(next(model.parameters()))}
 
@@ -68,7 +68,7 @@ def test_save_checkpoint_records_optimizer_and_best(tmp_path):
     payload = torch.load(step_file)
     assert payload["step"] == 12
     assert payload["epoch"] == 5
-    assert payload["best_val_loss"] == 0.4
+    assert payload["best_val_metric"] == 0.4
     assert payload["monitor_value"] == 0.4
     torch.testing.assert_close(payload["ema_state"]["weight"], ema_state["weight"])
     assert payload["optimizer_states"][0] == optimizer.state_dict()
@@ -90,14 +90,14 @@ def test_load_checkpoint_restores_training_state(tmp_path, monkeypatch):
         step=7,
         total_steps=100,
         epoch=3,
-        best_val_loss=0.6,
+        best_val_metric=0.6,
     )
     train_state.schedulers = [scheduler]
     scheduler.step()
 
     ema_state = {"weight": torch.full_like(next(base_model.parameters()), 2.0)}
 
-    train_state.best_val_loss = 0.55
+    train_state.best_val_metric = 0.55
 
     pretrain.save_train_state(
         config,
@@ -132,13 +132,13 @@ def test_load_checkpoint_restores_training_state(tmp_path, monkeypatch):
         scheduler_states=payload["scheduler_state"],
         initial_step=payload["step"],
         initial_epoch=payload["epoch"],
-        best_val_loss=payload["best_val_loss"],
+        best_val_metric=payload["best_val_metric"],
         ema_state=payload["ema_state"],
     )
 
     assert resumed_state.step == 7
     assert resumed_state.epoch == 3
-    assert resumed_state.best_val_loss == 0.55
+    assert resumed_state.best_val_metric == 0.55
     assert resumed_state.scheduler_states == payload["scheduler_state"]
     torch.testing.assert_close(resumed_state.ema_state["weight"], ema_state["weight"])
 
@@ -147,3 +147,35 @@ def test_load_checkpoint_restores_training_state(tmp_path, monkeypatch):
         payload["model_state"]["weight"],
     )
     assert resumed_state.optimizers[0].state_dict()["state"] == payload["optimizer_states"][0]["state"]
+
+
+def test_load_checkpoint_converts_legacy_best_metric(tmp_path):
+    checkpoint_dir = tmp_path / "ckpt"
+    checkpoint_dir.mkdir()
+
+    model = nn.Linear(2, 2)
+    optimizer_state = SGD(model.parameters(), lr=0.1).state_dict()
+
+    legacy_payload = {
+        "model_state": model.state_dict(),
+        "optimizer_states": [optimizer_state],
+        "scheduler_state": [{"step": 1}],
+        "step": 1,
+        "epoch": 1,
+        "best_val_loss": 0.5,
+        "monitor": "val/loss",
+        "monitor_value": 0.5,
+        "ema_state": None,
+    }
+
+    ckpt_path = checkpoint_dir / "step_00000001.ckpt"
+    torch.save(legacy_payload, ckpt_path)
+    (checkpoint_dir / "latest.txt").write_text(ckpt_path.name)
+
+    config = _make_config(checkpoint_dir, resume=True)
+    payload = pretrain.load_checkpoint(config)
+
+    assert payload is not None
+    assert payload["best_val_metric"] == legacy_payload["best_val_loss"]
+    assert "best_val_loss" in payload
+    assert payload["optimizer_states"][0] == optimizer_state

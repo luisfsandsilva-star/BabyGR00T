@@ -40,11 +40,15 @@ wandb login YOUR-LOGIN # login if you want the logger to sync results to your We
 
 ### Checkpointing & resuming training
 
-- All checkpoints live under `checkpoint.path` (defaults to `checkpoints/<project>/<run>`). Each evaluation step writes a numbered file (`step_00000010.ckpt`) plus an updated `latest.txt` pointer. The best checkpoint according to `checkpoint.monitor` is mirrored to `best.ckpt`.
-- Set `checkpoint.monitor` (default `val/loss`) and `checkpoint.mode` (`min` or `max`) to control which validation metric defines “best”. The monitor string is matched against the flattened validation metrics (`val/regression_loss`, `eval/arc/accuracy`, …).
+- All checkpoints live under `checkpoint.path` (defaults to `checkpoints/<project>/<run>`). Each evaluation step writes a numbered file (`step_00000010.ckpt`) plus an updated `latest.txt` pointer. When the monitored metric improves the same payload is mirrored to `best.ckpt`.
+- Set `checkpoint.monitor` (default `val/loss`) and `checkpoint.mode` (`min` or `max`) to control which validation metric defines “best”. The monitor string is matched against the flattened validation metrics (`val/regression_loss`, `eval/arc/accuracy`, …). Disable automatic best-tracking by setting `checkpoint.monitor=null`.
 - Use `checkpoint.keep_last=<N>` to keep only the most recent `N` step checkpoints while still retaining `best.ckpt`. Leave it as `null` to keep the full history.
 - To resume, point Hydra to the directory and flip `checkpoint.resume=true`. By default the trainer reloads `latest.txt`. Override the exact file with `checkpoint.resume_from=path/to/checkpoint.ckpt`.
-- Resuming restores the model weights, every optimizer in the stack, tracked schedulers, the EMA shadow weights (when enabled), and the training counters (`step`, `epoch`, `best_val_loss`). Training picks up at the next evaluation window using the restored learning-rate schedule and progress bar state.
+- Examples:
+  - `python pretrain.py checkpoint.path=/tmp/run_01 checkpoint.monitor=val/accuracy checkpoint.mode=max`
+  - `python pretrain.py checkpoint.path=/tmp/run_01 checkpoint.resume=true`
+  - `python pretrain.py checkpoint.path=/tmp/run_01 checkpoint.resume_from=best.ckpt`
+- Resuming restores the model weights, every optimizer in the stack, tracked schedulers, the EMA shadow weights (when enabled), and the training counters (`step`, `epoch`, `best_val_metric`). Training picks up at the next evaluation window using the restored learning-rate schedule and progress bar state.
 
 ### Dataset Preparation
 
