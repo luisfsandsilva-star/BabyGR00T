@@ -52,7 +52,7 @@ class CheckpointConfig(pydantic.BaseModel):
     path: Optional[str] = None
     resume: bool = False
     resume_from: Optional[str] = None
-    monitor: str = "val/loss"
+    monitor: Optional[str] = "val/loss"
     mode: Literal["min", "max"] = "min"
     keep_last: Optional[int] = None
 
@@ -500,7 +500,7 @@ class TrainState:
     step: int
     total_steps: int
     epoch: int = 0
-    best_val_loss: Optional[float] = None
+    best_val_metric: Optional[float] = None
     schedulers: Sequence[Any] = ()
     scheduler_states: Optional[Sequence[Dict[str, Any]]] = None
     ema_state: Optional[Dict[str, Any]] = None
@@ -681,7 +681,7 @@ def init_train_state(
     scheduler_states: Optional[Sequence[Dict[str, Any]]] = None,
     initial_step: int = 0,
     initial_epoch: int = 0,
-    best_val_loss: Optional[float] = None,
+    best_val_metric: Optional[float] = None,
     ema_state: Optional[Dict[str, Any]] = None,
 ):
     # Estimated total training steps
@@ -709,7 +709,7 @@ def init_train_state(
         optimizer_lrs=optimizer_lrs,
         carry=None,
         epoch=initial_epoch,
-        best_val_loss=best_val_loss,
+        best_val_metric=best_val_metric,
         scheduler_states=scheduler_states,
         ema_state=ema_state,
     )
@@ -791,7 +791,7 @@ def save_train_state(
         "scheduler_state": scheduler_states,
         "step": train_state.step,
         "epoch": train_state.epoch,
-        "best_val_loss": train_state.best_val_loss,
+        "best_val_metric": train_state.best_val_metric,
         "monitor": config.checkpoint.monitor,
         "monitor_value": monitor_value,
         "ema_state": ema_payload,
@@ -872,6 +872,9 @@ def load_checkpoint(config: PretrainConfig) -> Optional[Dict[str, Any]]:
 
     if isinstance(raw_checkpoint, dict) and "model_state" in raw_checkpoint:
         checkpoint_payload = dict(raw_checkpoint)
+        if "best_val_metric" not in checkpoint_payload:
+            legacy_best = checkpoint_payload.get("best_val_loss")
+            checkpoint_payload["best_val_metric"] = legacy_best
     else:
         checkpoint_payload = {
             "model_state": raw_checkpoint,
@@ -879,11 +882,14 @@ def load_checkpoint(config: PretrainConfig) -> Optional[Dict[str, Any]]:
             "scheduler_state": None,
             "step": 0,
             "epoch": 0,
-            "best_val_loss": None,
+            "best_val_metric": None,
             "monitor": None,
             "monitor_value": None,
             "ema_state": None,
         }
+
+    if "best_val_metric" not in checkpoint_payload:
+        checkpoint_payload["best_val_metric"] = None
 
     checkpoint_payload["checkpoint_path"] = str(checkpoint_path)
     return checkpoint_payload
@@ -1322,7 +1328,7 @@ def launch(hydra_config: DictConfig):
     scheduler_states = None
     initial_step = 0
     initial_epoch = 0
-    best_val_loss = None
+    best_val_metric = None
     ema_state = None
 
     if checkpoint_payload is not None:
@@ -1332,7 +1338,7 @@ def launch(hydra_config: DictConfig):
             scheduler_states = checkpoint_payload.get("scheduler_state")
             initial_step = int(checkpoint_payload.get("step", 0) or 0)
             initial_epoch = int(checkpoint_payload.get("epoch", 0) or 0)
-            best_val_loss = checkpoint_payload.get("best_val_loss")
+            best_val_metric = checkpoint_payload.get("best_val_metric")
             ema_state = checkpoint_payload.get("ema_state")
 
     train_state = init_train_state(
@@ -1345,7 +1351,7 @@ def launch(hydra_config: DictConfig):
         scheduler_states=scheduler_states,
         initial_step=initial_step,
         initial_epoch=initial_epoch,
-        best_val_loss=best_val_loss,
+        best_val_metric=best_val_metric,
         ema_state=ema_state,
     )
 
@@ -1480,8 +1486,12 @@ def launch(hydra_config: DictConfig):
                 ema_state = ema_helper.state_dict() if config.ema else None
                 improved = False
                 if config.checkpoint.monitor is not None:
-                    if _is_improvement(config.checkpoint.mode, monitor_value, train_state.best_val_loss):
-                        train_state.best_val_loss = monitor_value
+                    if _is_improvement(
+                        config.checkpoint.mode,
+                        monitor_value,
+                        train_state.best_val_metric,
+                    ):
+                        train_state.best_val_metric = monitor_value
                         improved = monitor_value is not None
                 save_train_state(
                     config,
