@@ -99,6 +99,7 @@ class PretrainConfig(pydantic.BaseModel):
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
+    verbose_eval: bool = False
 
     # Logging
     use_wandb: bool = True
@@ -1007,8 +1008,67 @@ def evaluate(
     rank: int,
     world_size: int,
     cpu_group: Optional[dist.ProcessGroup],
+    progress_bar: Optional[tqdm.tqdm] = None,
 ):
     reduced_metrics = None
+
+    def _maybe_log_eval_message(message: str) -> None:
+        if rank != 0 or not config.verbose_eval:
+            return
+
+        if progress_bar is not None:
+            progress_bar.write(message)
+        else:
+            tqdm.tqdm.write(message)
+
+    def _estimate_total_eval_batches() -> Optional[int]:
+        dataset = getattr(eval_loader, "dataset", None)
+        if dataset is None:
+            return None
+
+        lazy_loader = getattr(dataset, "_lazy_load_dataset", None)
+        if callable(lazy_loader):
+            try:
+                lazy_loader()
+            except Exception:
+                return None
+
+        data = getattr(dataset, "_data", None)
+        dataset_config = getattr(dataset, "config", None)
+        global_batch_size = getattr(dataset_config, "global_batch_size", None)
+
+        if not isinstance(global_batch_size, int) or global_batch_size <= 0:
+            return None
+
+        if not isinstance(data, dict) or not data:
+            return None
+
+        total_batches = 0
+        for value in data.values():
+            inputs = value.get("inputs") if isinstance(value, dict) else None
+            if inputs is None:
+                continue
+
+            try:
+                num_examples = len(inputs)
+            except TypeError:
+                continue
+
+            total_batches += math.ceil(num_examples / global_batch_size)
+
+        return total_batches or None
+
+    total_eval_batches = _estimate_total_eval_batches()
+    processed_batches = 0
+
+    def _update_progress_bar() -> None:
+        if progress_bar is None:
+            return
+
+        if total_eval_batches:
+            progress_bar.set_postfix_str(f"eval {processed_batches}/{total_eval_batches}")
+        else:
+            progress_bar.set_postfix_str(f"eval {processed_batches}")
 
     with torch.inference_mode():
         return_keys = set(config.eval_save_outputs)
@@ -1026,13 +1086,14 @@ def evaluate(
         metric_values = None
 
         carry = None
-        processed_batches = 0
-        
+
+        _update_progress_bar()
+
         for set_name, batch, global_batch_size in eval_loader:
             processed_batches += 1
-            if rank == 0:
-                print(f"Processing batch {processed_batches}: {set_name}")
-            
+            _update_progress_bar()
+            _maybe_log_eval_message(f"Processing batch {processed_batches}: {set_name}")
+
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
@@ -1049,8 +1110,7 @@ def evaluate(
                 if all_finish:
                     break
 
-            if rank == 0:
-                print(f"  Completed inference in {inference_steps} steps")
+            _maybe_log_eval_message(f"  Completed inference in {inference_steps} steps")
 
             for collection in (batch, preds):
                 for k, v in collection.items():
@@ -1113,13 +1173,11 @@ def evaluate(
                     reduced_metrics[set_name] = {k: v / count for k, v in m.items()}
 
         # Run evaluators
-        if rank == 0:
-            print(f"\nRunning {len(evaluators)} evaluator(s)...")
-            
+        _maybe_log_eval_message(f"Running {len(evaluators)} evaluator(s)...")
+
         for i, evaluator in enumerate(evaluators):
-            if rank == 0:
-                print(f"Running evaluator {i+1}/{len(evaluators)}: {evaluator.__class__.__name__}")
-                
+            _maybe_log_eval_message(f"Running evaluator {i+1}/{len(evaluators)}: {evaluator.__class__.__name__}")
+
             # Path for saving
             evaluator_save_path = None
             if checkpoint_dir is not None:
@@ -1133,10 +1191,12 @@ def evaluate(
                     reduced_metrics = {}
 
                 reduced_metrics.update(metrics)
-                print(f"  Completed {evaluator.__class__.__name__}")
-                
-        if rank == 0:
-            print("All evaluators completed!")
+                _maybe_log_eval_message(f"  Completed {evaluator.__class__.__name__}")
+
+        _maybe_log_eval_message("All evaluators completed!")
+
+    if progress_bar is not None:
+        progress_bar.set_postfix_str("")
 
     return reduced_metrics
 
@@ -1463,6 +1523,7 @@ def launch(hydra_config: DictConfig):
                     rank=RANK,
                     world_size=WORLD_SIZE,
                     cpu_group=CPU_PROCESS_GROUP,
+                    progress_bar=progress_bar,
                 )
                 if RANK == 0 and metrics is not None:
                     if config.use_wandb:
