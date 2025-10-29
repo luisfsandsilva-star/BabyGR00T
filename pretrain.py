@@ -17,7 +17,10 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 import tqdm
-import wandb
+try:
+    import wandb  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - wandb is optional at runtime
+    wandb = None  # type: ignore
 import coolname
 import hydra
 import pydantic
@@ -1201,6 +1204,9 @@ def evaluate(
     return reduced_metrics
 
 def save_code_and_config(config: PretrainConfig):
+    if not config.use_wandb or wandb is None:
+        return
+
     checkpoint_dir = _get_checkpoint_dir(config)
     if checkpoint_dir is None or wandb.run is None:
         return
@@ -1283,6 +1289,11 @@ def launch(hydra_config: DictConfig):
     log_dir_path: Optional[Path] = None
     log_path: Optional[Path] = None
     run_logger: Optional[logging.Logger] = None
+    if config.use_wandb and wandb is None:
+        raise RuntimeError(
+            "Weights & Biases is not available. Install 'wandb' or run with use_wandb=false."
+        )
+
     if RANK == 0:
         resolved_dir = Path(config.log_dir).expanduser()
         config.log_dir = str(resolved_dir.resolve())
@@ -1423,7 +1434,7 @@ def launch(hydra_config: DictConfig):
         num_params = sum(x.numel() for x in train_state.model.parameters())
         if run_logger is not None:
             run_logger.info("MODEL num_params=%d", num_params)
-        if config.use_wandb:
+        if config.use_wandb and wandb is not None:
             wandb.init(
                 project=config.project_name,
                 name=config.run_name,
@@ -1487,7 +1498,7 @@ def launch(hydra_config: DictConfig):
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
-                if config.use_wandb:
+                if config.use_wandb and wandb is not None:
                     wandb.log(metrics, step=train_state.step)
                 else:
                     _log_metrics(run_logger, f"TRAIN step={train_state.step}", metrics, print_to_console=True, progress_bar=progress_bar)
@@ -1526,7 +1537,7 @@ def launch(hydra_config: DictConfig):
                     progress_bar=progress_bar,
                 )
                 if RANK == 0 and metrics is not None:
-                    if config.use_wandb:
+                    if config.use_wandb and wandb is not None:
                         wandb.log(metrics, step=train_state.step)
                     else:
                         _log_metrics(run_logger, f"VAL step={train_state.step}", metrics, print_to_console=True, progress_bar=progress_bar)
@@ -1591,7 +1602,7 @@ def launch(hydra_config: DictConfig):
     # finalize
     if dist.is_initialized():
         dist.destroy_process_group()
-    if config.use_wandb and wandb.run is not None:
+    if config.use_wandb and wandb is not None and wandb.run is not None:
         wandb.finish()
 
 
