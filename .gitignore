@@ -18,6 +18,8 @@ data/
 outputs/
 checkpoints/
 attention_prints/
+GR00T_N1.5/
+assets/
 
 # IDE
 .vscode/
@@ -38,3 +40,4 @@ Thumbs.db
 
 # Logs
 *.log
+DOCKER.md

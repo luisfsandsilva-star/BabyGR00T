@@ -13,6 +13,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
 
+import numpy as np
 import tqdm
 import coolname
 import hydra
@@ -919,7 +920,7 @@ def launch(hydra_config: DictConfig):
     # Standard behavior: single train loader, single eval loader.
     # Evaluation is scheduled based on training *epochs* using config.eval_interval.
     #
-    # Construimos un único dataloader de entrenamiento.
+    # Build a single training dataloader.
     train_loader, train_metadata = create_dataloader(
         config,
         "train",
@@ -944,20 +945,16 @@ def launch(hydra_config: DictConfig):
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
 
-    # Compute steps per epoch analíticamente a partir del tamaño del dataset,
-    # sin iterar un dataloader extra. Esto asegura que:
-    #  - La barra de progreso tiene un total realista.
-    #  - El schedule de LR (compute_lr) usa el nº real de pasos de entrenamiento.
-    import math
+    # Compute steps per epoch analytically from the dataset size,
+    # without iterating an extra dataloader. This ensures that:
+    #  - The progress bar has a realistic total.
+    #  - The LR schedule (compute_lr) uses the real number of training steps.
 
     steps_per_epoch = 0
     try:
-        from dataset.latent_npz_dataset import LatentNPZDataset  # type: ignore
-        import numpy as np  # type: ignore[import]
-
         train_dataset = getattr(train_loader, "dataset", None)
         if isinstance(train_dataset, LatentNPZDataset):
-            # Latent NPZ episodic dataset: contamos pares (t, t+time_offset)
+            # Latent NPZ episodic dataset: count pairs (t, t+time_offset)
             train_dataset._discover_files()
             k = max(1, int(train_dataset.config.time_offset))
             total_pairs = 0
@@ -967,23 +964,21 @@ def launch(hydra_config: DictConfig):
                 total_pairs += max(0, T - k)
             steps_per_epoch = max(1, math.ceil(total_pairs / config.global_batch_size))
         else:
-            # Fallback genérico: usar metadata (total_groups * mean_puzzle_examples)
+            # generic fallback: use metadata (total_groups * mean_puzzle_examples)
             total_examples = float(train_metadata.total_groups) * float(  # type: ignore[attr-defined]
                 getattr(train_metadata, "mean_puzzle_examples", 1.0)
             )
             steps_per_epoch = max(1, math.ceil(total_examples / config.global_batch_size))
     except Exception:
-        # Si algo falla, mantener un valor de respaldo razonable basado en el
-        # antiguo cálculo de total_steps.
+        # if something fails, keep a reasonable backup value based on the old total_steps calculation.
         steps_per_epoch = max(1, train_state.total_steps // max(config.epochs, 1))
 
-    # Actualizar total_steps para que el LR schedule y cualquier lógica que lo
-    # use vean el nº real de pasos de entrenamiento.
+    # update total_steps so LR schedule and any logic that uses it sees the real number of training steps.
     train_state.total_steps = steps_per_epoch * config.epochs
 
-    # Si el checkpoint contiene un estado de entrenamiento completo (modelo + optimizadores + paso),
-    # restáuralo ahora. Si el archivo sólo tiene pesos del modelo, esto no hará nada y
-    # sólo se habrán cargado los pesos en create_model/load_checkpoint.
+    # if the checkpoint contains a complete training state (model + optimizers + step),
+    # restore it now. If the file only has model weights, this will do nothing and
+    # only the weights will be loaded in create_model/load_checkpoint.
     train_state = load_train_state_if_available(config, train_state)
 
     # Progress bar and logger
@@ -1107,57 +1102,57 @@ def launch(hydra_config: DictConfig):
             # End for over train_loader (one full epoch)
 
             # Epoch-based eval scheduling: every N epochs, after min_eval_interval (interpreted in epochs)
-                if (
-                    eval_loader is not None
-                    and evaluators is not None
-                    and config.eval_interval is not None
+            if (
+                eval_loader is not None
+                and evaluators is not None
+                and config.eval_interval is not None
                 and (epoch + 1) >= (config.min_eval_interval or 0)
                 and (epoch + 1) % config.eval_interval == 0
-                ):
-                    if RANK == 0:
-                        print(f"EVALUATE (epoch {epoch+1})")
-                    if config.ema:
-                        print("SWITCH TO EMA")
-                        train_state_eval = copy.deepcopy(train_state)
-                        train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
-                    else:
-                        train_state_eval = train_state
-                    train_state_eval.model.eval()
-                    metrics_eval = evaluate(
-                        config,
-                        train_state_eval,
-                        eval_loader,
-                        eval_metadata,
-                        evaluators,
-                        rank=RANK,
-                        world_size=WORLD_SIZE,
-                        cpu_group=CPU_PROCESS_GROUP,
-                    )
+            ):
+                if RANK == 0:
+                    print(f"EVALUATE (epoch {epoch+1})")
+                if config.ema:
+                    print("SWITCH TO EMA")
+                    train_state_eval = copy.deepcopy(train_state)
+                    train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+                else:
+                    train_state_eval = train_state
+                train_state_eval.model.eval()
+                metrics_eval = evaluate(
+                    config,
+                    train_state_eval,
+                    eval_loader,
+                    eval_metadata,
+                    evaluators,
+                    rank=RANK,
+                    world_size=WORLD_SIZE,
+                    cpu_group=CPU_PROCESS_GROUP,
+                )
 
-                    if RANK == 0 and metrics_eval is not None:
-                        # Optional wandb logging
-                        if config.use_wandb and wandb is not None and wandb.run is not None:
-                            wandb.log(metrics_eval, step=train_state.step)
+                if RANK == 0 and metrics_eval is not None:
+                    # Optional wandb logging
+                    if config.use_wandb and wandb is not None and wandb.run is not None:
+                        wandb.log(metrics_eval, step=train_state.step)
 
-                        # Human-readable eval summary
-                        print(f"[Eval] epoch {epoch+1}, step {train_state.step}")
-                        for key, value in metrics_eval.items():
-                            # Metrics may be nested dicts (e.g., per split)
-                            if isinstance(value, dict):
-                                print(f"  {key}:")
-                                for sub_k, sub_v in value.items():
-                                    print(f"    {sub_k}: {sub_v}")
-                            else:
-                                print(f"  {key}: {value}")
+                    # Human-readable eval summary
+                    print(f"[Eval] epoch {epoch+1}, step {train_state.step}")
+                    for key, value in metrics_eval.items():
+                        # Metrics may be nested dicts (e.g., per split)
+                        if isinstance(value, dict):
+                            print(f"  {key}:")
+                            for sub_k, sub_v in value.items():
+                                print(f"    {sub_k}: {sub_v}")
+                        else:
+                            print(f"  {key}: {value}")
 
-                    # Checkpointing on eval
-                    if RANK == 0:
-                        print("SAVE CHECKPOINT")
-                    if RANK == 0 and config.checkpoint_every_eval:
-                        save_train_state(config, train_state_eval)
+                # Checkpointing on eval
+                if RANK == 0:
+                    print("SAVE CHECKPOINT")
+                if RANK == 0 and config.checkpoint_every_eval:
+                    save_train_state(config, train_state_eval)
 
-                    if config.ema and train_state_eval is not train_state:
-                        del train_state_eval
+                if config.ema and train_state_eval is not train_state:
+                    del train_state_eval
 
 
     except KeyboardInterrupt:

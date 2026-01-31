@@ -48,8 +48,8 @@ RUN pip install --no-cache-dir --upgrade \
 # GR00T Dependencies (Teacher Model for Distillation)
 # ==============================================================================
 # Copy GR00T package definition
-COPY grutito/pyproject.toml /tmp/grutito/pyproject.toml
-WORKDIR /tmp/grutito
+COPY GR00T_N1.5/pyproject.toml /tmp/GR00T_N1.5/pyproject.toml
+WORKDIR /tmp/GR00T_N1.5
 
 # Install GR00T base dependencies
 RUN pip install --no-cache-dir \
@@ -95,8 +95,8 @@ RUN pip install --no-cache-dir \
 # ==============================================================================
 # Install GR00T Package
 # ==============================================================================
-COPY grutito/ /workspace/grutito/
-WORKDIR /workspace/grutito
+COPY GR00T_N1.5/ /workspace/GR00T_N1.5/
+WORKDIR /workspace/GR00T_N1.5
 RUN pip install --no-cache-dir -e . --no-deps
 
 # ==============================================================================
