@@ -13,7 +13,6 @@ BabyGR00T achieves comparable generalization with a fraction of the parameters t
 - **Structured knowledge distillation** from the GR00T N1.5 teacher  
 - **Recursive reasoning core (TRM)** that iteratively refines internal states  
 - **Compact vision-language grounding** using nanoLLaVA-1B  
-- **Data-centric optimization** with simulated *dream rollouts* and imitation learning  
 
 The system targets a balance between performance, speed, and deployability.
 
@@ -46,9 +45,6 @@ Encodes state and action tokens into TRM latents, then decodes refined latents b
 
 2. **Encoder–Decoder Imitation Learning**  
    Train the compact TRM-based student model to emulate GR00T’s action–state dynamics with joint reconstruction and distillation losses.
-
-3. **(Deferred) Depth Fusion**  
-   Depth-based perception (e.g., Depth Anything v2-S) will be revisited in *future work* for richer spatial understanding while maintaining real-time performance.
 
 ---
 
@@ -94,7 +90,6 @@ Metrics include latent-alignment loss, imitation accuracy, latency, and energy e
 | **TRM** | Recursive reasoning | 7 M parameters · latent refinement · minimal compute |
 | **nanoLLaVA-1B** | Visual–language grounding | 1 B parameters · SigLIP encoder · edge-friendly |
 | **Distillation Pipeline** | Teacher–student training | Representation + behavioral transfer |
-| **Dream Data** | Synthetic augmentation | Expands diversity without real-world data cost |
 
 ---
 
