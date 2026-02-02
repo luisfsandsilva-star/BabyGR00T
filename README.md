@@ -29,7 +29,7 @@ A ~1B-parameter vision-language model based on a compact Qwen-style LLM and a Si
 It provides efficient image–text grounding for scene understanding, captioning, and robotic instruction following with minimal memory footprint.
 
 **TRM (Tiny Recursive Model)**  
-A ~7M-parameter recursive reasoning model developed by Samsung SAIT Montréal.  
+A ~140-parameter recursive reasoning model developed by Samsung SAIT Montréal.  
 It updates a latent state *z* and candidate output *y* through multiple refinement steps given input *x*, achieving high reasoning quality without large-scale architectures.
 
 **Encoder–Decoder Interface**  
@@ -87,7 +87,7 @@ Metrics include latent-alignment loss, imitation accuracy, latency, and energy e
 
 | Component | Role | Key Traits |
 |------------|------|------------|
-| **TRM** | Recursive reasoning | 7 M parameters · latent refinement · minimal compute |
+| **TRM** | Recursive reasoning | 140 M parameters · latent refinement · minimal compute |
 | **nanoLLaVA-1B** | Visual–language grounding | 1 B parameters · SigLIP encoder · edge-friendly |
 | **Distillation Pipeline** | Teacher–student training | Representation + behavioral transfer |
 
@@ -132,6 +132,7 @@ If you use BabyGR00T in research or development, please cite:
 
 - Jolicoeur-Martineau, A. (2025). *Less is More: Recursive Reasoning with Tiny Networks (TRM).*  
 - Liu et al. (2024). *nanoLLaVA-1B: Compact Vision-Language Models for Edge AI.*
+- Bjorck et al. (2025). *GR00T N1: An Open Foundation Model for Generalist Humanoid Robots.*
 
 ---
 
