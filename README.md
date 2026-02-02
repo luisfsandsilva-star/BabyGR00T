@@ -33,7 +33,7 @@ A ~140M-parameter recursive reasoning model developed by Samsung SAIT Montréal.
 It updates a latent state *z* and candidate output *y* through multiple refinement steps given input *x*, achieving high reasoning quality without large-scale architectures.
 
 **Encoder–Decoder Interface**  
-Encodes state and action tokens into TRM latents, then decodes refined latents back into next-state or action predictions—enabling closed-loop policy reasoning.
+Encodes state and action tokens into TRM latents, then decodes refined latents back into next-state or action predictions, enabling closed-loop policy reasoning.
 
 ---
 
