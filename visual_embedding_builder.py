@@ -68,9 +68,14 @@ DEBUG_STATE = {
     "hang_detected": False
 }
 
+# Print control (set in main() after parsing args)
+PRINT_DEBUG = True
+PRINT_PROGRESS = True
+
 def debug_log(message: str, level: str = "INFO"):
     """Enhanced debug logging with timestamps and state tracking"""
     global DEBUG_STATE
+    global PRINT_DEBUG
     current_time = time.time()
     elapsed = current_time - DEBUG_STATE["last_log_time"]
     DEBUG_STATE["last_log_time"] = current_time
@@ -78,13 +83,15 @@ def debug_log(message: str, level: str = "INFO"):
     # Check for hangs (no log for >30 seconds)
     if elapsed > 30:
         DEBUG_STATE["hang_detected"] = True
-        print(f"🚨 HANG DETECTED: No logs for {elapsed:.1f}s - {message}")
-        sys.stdout.flush()
+        if PRINT_DEBUG:
+            print(f"🚨 HANG DETECTED: No logs for {elapsed:.1f}s - {message}")
+            sys.stdout.flush()
     
     state_info = f"[Episode: {DEBUG_STATE['current_episode']}, Batch: {DEBUG_STATE['current_frame_batch']}]"
     timestamp = time.strftime("%H:%M:%S")
-    print(f"🔍 [{timestamp}] DEBUG {level} {state_info}: {message}")
-    sys.stdout.flush()  # Force immediate output
+    if PRINT_DEBUG:
+        print(f"🔍 [{timestamp}] DEBUG {level} {state_info}: {message}")
+        sys.stdout.flush()  # Force immediate output
     
     # Also log to file with immediate flush
     logging.getLogger().info(f"DEBUG {level} {state_info}: {message}")
@@ -93,15 +100,17 @@ def debug_log(message: str, level: str = "INFO"):
 def progress_log(message: str, progress: str = ""):
     """Progress logging with immediate output"""
     global DEBUG_STATE
+    global PRINT_PROGRESS
     current_time = time.time()
     timestamp = time.strftime("%H:%M:%S")
     state_info = f"[Episode: {DEBUG_STATE['current_episode']}, Batch: {DEBUG_STATE['current_frame_batch']}]"
     
-    if progress:
-        print(f"📊 [{timestamp}] PROGRESS {state_info}: {message} ({progress})")
-    else:
-        print(f"📊 [{timestamp}] PROGRESS {state_info}: {message}")
-    sys.stdout.flush()
+    if PRINT_PROGRESS:
+        if progress:
+            print(f"📊 [{timestamp}] PROGRESS {state_info}: {message} ({progress})")
+        else:
+            print(f"📊 [{timestamp}] PROGRESS {state_info}: {message}")
+        sys.stdout.flush()
     
     # Also log to file
     logging.getLogger().info(f"PROGRESS {state_info}: {message} ({progress})")
@@ -180,9 +189,6 @@ def setup_logger(out_root: Path, verbose: bool = True) -> logging.Logger:
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    print("🚀 STARTING SCRIPT - Initializing...")
-    sys.stdout.flush()
-    
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--out-root", type=Path, required=True, help="Output root directory")
     parser.add_argument("--model-id", type=str, default="NexaAI/NanoLLaVA", help="Model ID on Hugging Face")
@@ -212,12 +218,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--local-model-dir", type=Path, default=None, help="Path to a local model directory to load offline")
     parser.add_argument("--local-files-only", action="store_true", help="Do not make any network calls when loading model/tokenizer")
     parser.add_argument("--concat-vision", action="store_true", help="Prepend projected vision tokens to last hidden states and save the combined sequence")
-    print("🔧 PARSING ARGUMENTS...")
-    sys.stdout.flush()
+    parser.add_argument("--quiet", action="store_true", help="Reduce stdout noise (still logs to out-root/build.log).")
+    parser.add_argument("--debug", action="store_true", help="Enable extra debug stdout (very verbose).")
     args = parser.parse_args(argv)
-    
-    print(f"✅ ARGUMENTS PARSED: {args}")
-    sys.stdout.flush()
     return args
 
 
@@ -383,23 +386,18 @@ def _move_to_device(obj, device, dtype):
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    print("🎯 ENTERING MAIN FUNCTION")
-    sys.stdout.flush()
-    
     args = parse_args(argv)
-    print("📋 MAIN: Arguments parsed successfully")
-    sys.stdout.flush()
-    print("📝 MAIN: Setting up logger...")
-    sys.stdout.flush()
-    logger = setup_logger(args.out_root)
-    print("✅ MAIN: Logger setup complete")
-    sys.stdout.flush()
+    global PRINT_DEBUG, PRINT_PROGRESS
+    # stdout policy:
+    # - default: progress + some debug (existing behavior, but now controllable)
+    # - --quiet: suppress stdout logs, keep file logs
+    # - --debug: enable verbose debug stdout
+    PRINT_PROGRESS = not bool(args.quiet)
+    PRINT_DEBUG = bool(args.debug) and (not bool(args.quiet))
 
-    print("🔍 MAIN: Getting versions...")
-    sys.stdout.flush()
+    logger = setup_logger(args.out_root, verbose=(not bool(args.quiet)))
+
     versions = get_versions()
-    print("✅ MAIN: Versions retrieved")
-    sys.stdout.flush()
     
     print("📊 MAIN: Logging configuration...")
     sys.stdout.flush()
@@ -422,28 +420,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         **versions,
     }, ensure_ascii=False))
 
-    print("🗂️ MAIN: Resolving dataset root...")
-    sys.stdout.flush()
     # Resolve dataset root, optionally skip download
     default_snapshot_dir = args.out_root / "_datasets" / DATASET_ID.replace("/", "__")
     if args.dataset_root is not None:
-        print(f"📁 MAIN: Using provided dataset root: {args.dataset_root}")
-        sys.stdout.flush()
+        if PRINT_PROGRESS:
+            print(f"📁 MAIN: Using provided dataset root: {args.dataset_root}")
+            sys.stdout.flush()
         dataset_root = args.dataset_root
         logger.info("Using provided dataset root: %s", dataset_root)
         if not dataset_root.exists():
-            print(f"❌ MAIN: Provided dataset root does not exist: {dataset_root}")
-            sys.stdout.flush()
+            if PRINT_PROGRESS:
+                print(f"❌ MAIN: Provided dataset root does not exist: {dataset_root}")
+                sys.stdout.flush()
             logger.error("Provided --dataset-root does not exist: %s", dataset_root)
             return 2
     elif args.skip_download and default_snapshot_dir.exists():
-        print(f"📁 MAIN: Reusing existing snapshot at {default_snapshot_dir}")
-        sys.stdout.flush()
+        if PRINT_PROGRESS:
+            print(f"📁 MAIN: Reusing existing snapshot at {default_snapshot_dir}")
+            sys.stdout.flush()
         dataset_root = default_snapshot_dir
         logger.info("Reusing existing snapshot at %s (skip-download)", dataset_root)
     else:
-        print("📥 MAIN: Downloading dataset snapshot...")
-        sys.stdout.flush()
+        if PRINT_PROGRESS:
+            print("📥 MAIN: Downloading dataset snapshot...")
+            sys.stdout.flush()
         # Download dataset snapshot (filtered)
         dataset_root = snapshot_gr1_dataset(
             out_root=args.out_root,
@@ -452,8 +452,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             exclude_patterns=args.exclude_pattern,
             logger=logger,
         )
-        print(f"✅ MAIN: Dataset downloaded to: {dataset_root}")
-        sys.stdout.flush()
+        if PRINT_PROGRESS:
+            print(f"✅ MAIN: Dataset downloaded to: {dataset_root}")
+            sys.stdout.flush()
 
     print("📝 MAIN: Building prompts table...")
     sys.stdout.flush()

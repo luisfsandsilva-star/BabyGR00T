@@ -104,7 +104,7 @@ run_distill() {
         -v $(pwd)/outputs:/workspace/outputs \
         -e HF_TOKEN=${HF_TOKEN:-} \
         ${IMAGE_NAME} \
-        python build_gr1_omnivlm_embeddings_fixed.py "${@:2}"
+        python gr00t_distiller.py "${@:2}"
 }
 
 run_jupyter() {

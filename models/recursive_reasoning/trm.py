@@ -74,6 +74,13 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     causal_attn: bool = False
     cross_attn_enabled: bool = False
     cross_attn_num_heads: int = 0  # 0 -> use num_heads
+    # If True, avoid a second attention pass by prepending context tokens and using self-attn only.
+    fold_cross_attn: bool = True
+    # Cap the number of context tokens used when cross-attn is enabled (to keep RoPE/compute bounded).
+    max_cross_context_len: int = 64
+
+    # Register tokens (learned tokens appended near the prefix to improve capacity/stability)
+    register_tokens: int = 0
     
     # Halting Q-learning config
     halt_max_steps: int
@@ -105,18 +112,30 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 num_key_value_heads=config.num_heads,
                 causal=config.causal_attn
             )
-            # Optional cross-attention after self-attn, before MLP
+            # Optional cross-attention:
+            # - If fold_cross_attn=True, we *prepend* context tokens into self-attn and skip a separate cross-attn module.
+            # - Else, we keep the explicit CrossAttention block.
             if self.config.cross_attn_enabled:
-                num_heads_ca = (self.config.cross_attn_num_heads if self.config.cross_attn_num_heads > 0 else self.config.num_heads)
-                self.cross_attn = CrossAttention(
-                    hidden_size=config.hidden_size,
-                    head_dim=config.hidden_size // num_heads_ca,
-                    num_heads=num_heads_ca,
-                    num_key_value_heads=num_heads_ca,
-                    causal=False
+                # Learnable single-token context (fallback when no external context is provided)
+                self.cross_context = nn.Parameter(
+                    trunc_normal_init_(
+                        torch.empty(1, 1, config.hidden_size),
+                        std=1.0 / (config.hidden_size ** 0.5),
+                    )
                 )
-                # Learnable single-token context (placeholder until external context is wired)
-                self.cross_context = nn.Parameter(trunc_normal_init_(torch.empty(1, 1, config.hidden_size), std=1.0 / (config.hidden_size ** 0.5)))
+                if not self.config.fold_cross_attn:
+                    num_heads_ca = (
+                        self.config.cross_attn_num_heads
+                        if self.config.cross_attn_num_heads > 0
+                        else self.config.num_heads
+                    )
+                    self.cross_attn = CrossAttention(
+                        hidden_size=config.hidden_size,
+                        head_dim=config.hidden_size // num_heads_ca,
+                        num_heads=num_heads_ca,
+                        num_key_value_heads=num_heads_ca,
+                        causal=False,
+                    )
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
@@ -130,7 +149,7 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             # Peri-ScaleNorm pairs for sublayers
             self.pre_attn = ScaleNorm(config.hidden_size, eps=self.norm_eps)
             self.post_attn = ScaleNorm(config.hidden_size, eps=self.norm_eps)
-            if self.config.cross_attn_enabled:
+            if self.config.cross_attn_enabled and (not self.config.fold_cross_attn):
                 self.pre_cross = ScaleNorm(config.hidden_size, eps=self.norm_eps)
                 self.post_cross = ScaleNorm(config.hidden_size, eps=self.norm_eps)
         self.pre_mlp = ScaleNorm(config.hidden_size, eps=self.norm_eps)
@@ -147,22 +166,35 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             hs = self.post_mlp_t(hs)
             hidden_states = hs.transpose(1,2)
         else:
-            # Self Attention
-            attn_in = self.pre_attn(hidden_states)
-            attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=attn_in)
-            hidden_states = hidden_states + attn_out
-            hidden_states = self.post_attn(hidden_states)
-            # Cross Attention (optional)
-            if getattr(self, 'cross_attn', None) is not None:
-                # Prefer external context if provided, else fallback to learnable single-token
-                context = kwargs.get('cross_context', None)
+            # Self Attention (optionally folded cross-attn by prepending context tokens)
+            if self.config.cross_attn_enabled and self.config.fold_cross_attn:
+                context = kwargs.get("cross_context", None)
                 if context is None:
                     B = hidden_states.size(0)
                     context = self.cross_context.to(hidden_states.dtype).expand(B, 1, -1)
-                cross_in = self.pre_cross(hidden_states)
-                cross_out = self.cross_attn(hidden_states=cross_in, context=context)
-                hidden_states = hidden_states + cross_out
-                hidden_states = self.post_cross(hidden_states)
+                # Concatenate along sequence dimension: [B, Lc + L, D]
+                cat = torch.cat([context.to(hidden_states.dtype), hidden_states], dim=1)
+                attn_in = self.pre_attn(cat)
+                attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=attn_in)
+                cat = cat + attn_out
+                cat = self.post_attn(cat)
+                # Return only the original tokens (skip context prefix)
+                hidden_states = cat[:, context.size(1) :, :]
+            else:
+                attn_in = self.pre_attn(hidden_states)
+                attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=attn_in)
+                hidden_states = hidden_states + attn_out
+                hidden_states = self.post_attn(hidden_states)
+                # Cross Attention (optional explicit module)
+                if getattr(self, "cross_attn", None) is not None:
+                    context = kwargs.get("cross_context", None)
+                    if context is None:
+                        B = hidden_states.size(0)
+                        context = self.cross_context.to(hidden_states.dtype).expand(B, 1, -1)
+                    cross_in = self.pre_cross(hidden_states)
+                    cross_out = self.cross_attn(hidden_states=cross_in, context=context)
+                    hidden_states = hidden_states + cross_out
+                    hidden_states = self.post_cross(hidden_states)
         # Fully Connected
         mlp_in = self.pre_mlp(hidden_states)
         out = self.mlp(mlp_in)
@@ -231,8 +263,22 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 self.revin = RevIN(num_features=Fin, eps=self.config.revin_eps, affine=self.config.revin_affine)
             prefix_len = self.reg_prefix_len
 
+        # Register tokens (optional)
+        self.register_tokens = int(getattr(self.config, "register_tokens", 0) or 0)
+        if self.register_tokens > 0:
+            self.register = nn.Parameter(
+                trunc_normal_init_(
+                    torch.empty(1, self.register_tokens, self.config.hidden_size, dtype=self.forward_dtype),
+                    std=1.0 / (self.config.hidden_size ** 0.5),
+                )
+            )
+
         # LM Blocks
-        pos_len = self.config.seq_len + (prefix_len if 'prefix_len' in locals() else 0)
+        # Position embedding length:
+        # base tokens (prefix + registers + seq) plus an optional bounded cross-context prefix
+        base_pos_len = self.config.seq_len + int(prefix_len) + int(self.register_tokens)
+        extra_ctx = int(self.config.max_cross_context_len) if getattr(self.config, "cross_attn_enabled", False) else 0
+        pos_len = base_pos_len + extra_ctx
         if self.config.pos_encodings == "rope":
             self.rotary_emb = RotaryEmbedding(dim=self.config.hidden_size // self.config.num_heads,
                                               max_position_embeddings=pos_len,
@@ -246,8 +292,17 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.L_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
 
         # Initial states
-        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        # Use proper buffers so these move with .to(device) / DDP and don't cause CPU/CUDA mismatches.
+        self.register_buffer(
+            "H_init",
+            trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
+            persistent=True,
+        )
+        self.register_buffer(
+            "L_init",
+            trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
+            persistent=True,
+        )
 
         # Cross-attention context projection (lazy init when external context is provided)
         self.cross_ctx_proj: Optional[CastedLinear] = None
@@ -281,7 +336,16 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # Scale and optional IO norm
         out = self.embed_scale * embedding
-        return self.io_norm(out) if getattr(self, "io_norm", None) is not None else out
+        out = self.io_norm(out) if getattr(self, "io_norm", None) is not None else out
+
+        # Insert register tokens after the prefix (puzzle tokens), before the main sequence tokens.
+        if getattr(self, "register_tokens", 0) > 0:
+            B = out.size(0)
+            reg = self.register.to(out.dtype).expand(B, self.register_tokens, -1)
+            prefix_len = getattr(self, "puzzle_emb_len", 0)
+            out = torch.cat([out[:, :prefix_len], reg, out[:, prefix_len:]], dim=1)
+
+        return out
 
     def _input_embeddings_regression(self, inputs: torch.Tensor):
         # inputs: [B, L, Fin]
@@ -296,16 +360,24 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             emb = 0.707106781 * (emb + self.embed_pos.embedding_weight.to(self.forward_dtype))
         out = self.embed_scale * emb
         out = self.io_norm(out) if getattr(self, "io_norm", None) is not None else out
+        # Insert register tokens after CLS (if present), before the main sequence tokens.
+        if getattr(self, "register_tokens", 0) > 0:
+            B = out.size(0)
+            reg = self.register.to(out.dtype).expand(B, self.register_tokens, -1)
+            prefix_len = getattr(self, "reg_prefix_len", 0)
+            out = torch.cat([out[:, :prefix_len], reg, out[:, prefix_len:]], dim=1)
         return out, ctx
 
     def empty_carry(self, batch_size: int):
+        # Ensure carry tensors live on the same device as the model (important for CUDA runs).
+        device = self.H_init.device if hasattr(self, "H_init") else None
         if self.is_regression:
-            total_len = self.config.seq_len + getattr(self, 'reg_prefix_len', 0)
+            total_len = self.config.seq_len + getattr(self, 'reg_prefix_len', 0) + int(getattr(self, "register_tokens", 0))
         else:
-            total_len = self.config.seq_len + self.puzzle_emb_len
+            total_len = self.config.seq_len + self.puzzle_emb_len + int(getattr(self, "register_tokens", 0))
         return TinyRecursiveReasoningModel_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, total_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, total_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H=torch.empty(batch_size, total_len, self.config.hidden_size, dtype=self.forward_dtype, device=device),
+            z_L=torch.empty(batch_size, total_len, self.config.hidden_size, dtype=self.forward_dtype, device=device),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry):
@@ -330,6 +402,10 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         cross_ctx = None
         if getattr(self.config, 'cross_attn_enabled', False) and ("cross_context_raw" in batch):
             raw = batch["cross_context_raw"].to(self.forward_dtype)  # [B, Lc, Fc]
+            # Bound context length for compute + RoPE cache safety
+            max_lc = int(getattr(self.config, "max_cross_context_len", 0) or 0)
+            if max_lc > 0 and raw.size(1) > max_lc:
+                raw = raw[:, :max_lc, :]
             B, Lc, Fc = raw.shape
             D = self.config.hidden_size
             if Fc == D:
@@ -362,21 +438,22 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             # q-head reads CLS (position 0)
             q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
             pooling = self.config.pooling
+            reg_start = getattr(self, 'reg_prefix_len', 0) + int(getattr(self, "register_tokens", 0))
             if pooling is None:
                 # sequence regression
-                y_pred = self.reg_head(z_H)[:, getattr(self, 'reg_prefix_len', 0):]
+                y_pred = self.reg_head(z_H)[:, reg_start:]
             else:
                 # point regression
                 if pooling == "cls":
                     pooled = z_H[:, 0]
                 elif pooling == "first":
-                    pooled = z_H[:, getattr(self, 'reg_prefix_len', 0)]
+                    pooled = z_H[:, reg_start]
                 elif pooling == "last":
                     pooled = z_H[:, -1]
                 elif pooling == "mean":
-                    pooled = z_H[:, getattr(self, 'reg_prefix_len', 0):].mean(dim=1)
+                    pooled = z_H[:, reg_start:].mean(dim=1)
                 else:
-                    pooled = z_H[:, getattr(self, 'reg_prefix_len', 0):].mean(dim=1)
+                    pooled = z_H[:, reg_start:].mean(dim=1)
                 y_pred = self.reg_head(pooled)
 
             if (self.revin is not None) and (not self.config.revin_apply_on_outputs) and (revin_ctx is not None) and (y_pred.shape[-1] == revin_ctx["mu"].shape[-1]):
@@ -406,12 +483,13 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
+        device = batch["inputs"].device
 
         return TinyRecursiveReasoningModel_ACTV1Carry(
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
             
-            steps=torch.zeros((batch_size, ), dtype=torch.int32),
-            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
+            steps=torch.zeros((batch_size, ), dtype=torch.int32, device=device),
+            halted=torch.ones((batch_size, ), dtype=torch.bool, device=device),  # Default to halted
             
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
