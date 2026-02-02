@@ -29,7 +29,7 @@ A ~1B-parameter vision-language model based on a compact Qwen-style LLM and a Si
 It provides efficient image–text grounding for scene understanding, captioning, and robotic instruction following with minimal memory footprint.
 
 **TRM (Tiny Recursive Model)**  
-A ~140-parameter recursive reasoning model developed by Samsung SAIT Montréal.  
+A ~140M-parameter recursive reasoning model developed by Samsung SAIT Montréal.  
 It updates a latent state *z* and candidate output *y* through multiple refinement steps given input *x*, achieving high reasoning quality without large-scale architectures.
 
 **Encoder–Decoder Interface**  
