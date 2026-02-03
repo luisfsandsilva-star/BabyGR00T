@@ -15,11 +15,12 @@ build/
 
 # Data and outputs
 data/
+!Gr00tPolicy/**/data/
 outputs/
 checkpoints/
 attention_prints/
-GR00T_N1.5/
 assets/
+GR00T_N1.5/
 
 # IDE
 .vscode/
