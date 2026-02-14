@@ -1,33 +1,48 @@
-# BabyGR00T: Distilling GR00T N1.5 with TRM + nanoLLaVA-1B
+# BabyGR00T (research code)
 
-**BabyGR00T** is a compact, deployable variant of the **GR00T N1.5** foundational robotic model.  
-It integrates **Samsung SAIT’s Tiny Recursive Model (TRM)** for efficient reasoning and **nanoLLaVA-1B** for lightweight multimodal perception, enabling real-time operation on constrained robotic hardware.
+This repo contains a **teacher→student distillation pipeline** built around:
 
----
+- **`gr00t_distiller.py`**: runs the **GR00T N1.5** policy on GR1 episodes and saves per-timestep **teacher latents** to `.npz`.
+- **`pretrain.py` / `finetune.py`**: trains a **Tiny Recursive Reasoning Model (TRM)** to do **next-step latent prediction** (regression) on those `.npz` episodes.
+- **`visual_embedding_builder.py`** (optional): builds per-episode **VLM embeddings** (e.g. NanoLLaVA) that can be fed to TRM via **cross-attention** as extra context.
 
-## Overview
+The goal is to experiment with making a smaller student learn to “track” a larger teacher’s internal representations. This codebase is **not** a turnkey deployment project.
 
-Foundational robotic models such as GR00T N1.5, RT-X, and OpenVLA unify perception, reasoning, and control, but their high computational cost prevents on-device use.  
-BabyGR00T achieves comparable generalization with a fraction of the parameters through:
+## What’s in the repo
 
-- **Structured knowledge distillation** from the GR00T N1.5 teacher  
-- **Recursive reasoning core (TRM)** that iteratively refines internal states  
-- **Compact vision-language grounding** using nanoLLaVA-1B  
+- **Training entrypoint**: `pretrain.py` (Hydra config: `config/cfg_pretrain.yaml`)
+- **Student model**: `models/recursive_reasoning/trm.py` (`TinyRecursiveReasoningModel_ACTV1`)
+- **Latent dataset loader**: `dataset/latent_npz_dataset.py` (`LatentNPZDataset`)
+- **Teacher latent dumper**: `gr00t_distiller.py`
+- **Optional VLM context builder**: `visual_embedding_builder.py`
 
-The system targets a balance between performance, speed, and deployability.
+## Setup
 
----
+### Python environment
 
-## Architecture
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -U pip setuptools wheel
+pip install -r requirements.txt
+```
 
-![BabyGR00T Architecture](docs/figs/babygr00t_arch.png)
+### GR00T python package dependency
 
-### Components
+`gr00t_distiller.py` requires a python package that provides `gr00t.model.policy.Gr00tPolicy`.
+This package is not vendored in this repo yet, so you’ll need to install it separately (or add it once it’s included).
 
-**nanoLLaVA-1B (Perception front-end)**  
-A ~1B-parameter vision-language model based on a compact Qwen-style LLM and a SigLIP vision encoder.  
-It provides efficient image–text grounding for scene understanding, captioning, and robotic instruction following with minimal memory footprint.
+## Step 1 — (Optional) Build VLM embedding context
 
+If you want TRM to attend over per-episode VLM embeddings, generate them first:
+
+```bash
+python visual_embedding_builder.py \
+  --out-root /abs/path/to/vlm_embeddings \
+  --tasks-regex '^gr1_' \
+  --device cuda \
+  --resume
+```
 **TRM (Tiny Recursive Model)**  
 A ~140M-parameter recursive reasoning model developed by Samsung SAIT Montréal.  
 It updates a latent state *z* and candidate output *y* through multiple refinement steps given input *x*, achieving high reasoning quality without large-scale architectures.
@@ -35,87 +50,101 @@ It updates a latent state *z* and candidate output *y* through multiple refineme
 **Encoder–Decoder Interface**  
 Encodes state and action tokens into TRM latents, then decodes refined latents back into next-state or action predictions, enabling closed-loop policy reasoning.
 
----
+This writes per-episode `.npz` files whose main array is typically:
 
-## Methodology
+- `hidden`: `[N_frames, V_tokens, F_ctx]`
 
-1. **Foundational Distillation**  
-   Align TRM latent representations to GR00T’s multimodal encodings via teacher–student objectives.  
-   Use “dream data” synthetic rollouts to expand data diversity efficiently.
+During training, these are loaded and provided to the TRM blocks as `cross_context_raw`.
 
-2. **Encoder–Decoder Imitation Learning**  
-   Train the compact TRM-based student model to emulate GR00T’s action–state dynamics with joint reconstruction and distillation losses.
+## Step 2 — Distill teacher latents from GR00T N1.5
 
----
-
-## Hypothesis
-
-A strategically distilled GR00T N1.5 derivative can:
-
-1. Retain teacher-level perception, reasoning, and control accuracy  
-2. Operate efficiently under strict compute and energy constraints  
-3. Preserve generalization through recursive refinement and multimodal distillation  
-
-This supports the premise that *efficiency and generality in robotic intelligence can co-exist.*
-
----
-
-## Setup
-
-### Environment
+Run the teacher over GR1 episodes and dump latents:
 
 ```bash
-python -m venv venv
-source venv/bin/activate
-pip install -U pip setuptools wheel
-pip install -r requirements.txt
-# Optional: Weights & Biases logging
-wandb login
+python gr00t_distiller.py \
+  --repo nvidia/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim \
+  --model nvidia/GR00T-N1.5-3B \
+  --embodiment gr1 \
+  --out /abs/path/to/distill_out
 ```
 
-### Example — Distillation Training
+Output layout (per task directory):
+
+- `distill_out/<task>/latents/episode_000123.npz` (teacher latents)
+- `distill_out/<task>/metadata/episode_000123.jsonl` (pointers + shapes)
+
+Each `episode_*.npz` is expected to contain:
+
+- `latents`: typically shaped `[T, H, F]` (episode length × token length × feature dim)
+
+## Step 3 — Train TRM on the latent episodes (regression)
+
+Edit `config/cfg_pretrain.yaml` and set `data_paths` to your distilled output root(s),
+or override via Hydra:
 
 ```bash
-python train.py   --teacher_path checkpoints/gr00t_n15.pth   --data_path data/dream_rollouts   --vlm nanollava_1b   --reasoner trm_tiny   --epochs 200   --save_dir runs/babygr00t_trm_nanollava
+python pretrain.py \
+  data_paths=[/abs/path/to/distill_out] \
+  global_batch_size=16 \
+  epochs=10
 ```
 
-Metrics include latent-alignment loss, imitation accuracy, latency, and energy efficiency.
+## One-command runner (recommended)
 
----
+If you want a single script that creates directories and runs the steps in sequence:
 
-## Model Summary
+```bash
+python pipeline.py \
+  --train-epochs 10 \
+  --train-global-batch-size 16 \
+  --vlm-resume
+```
 
+Common variations:
+
+- Skip VLM embeddings:
+
+```bash
+python pipeline.py --skip-vlm
+```
 | Component | Role | Key Traits |
 |------------|------|------------|
 | **TRM** | Recursive reasoning | 140 M parameters · latent refinement · minimal compute |
 | **nanoLLaVA-1B** | Visual–language grounding | 1 B parameters · SigLIP encoder · edge-friendly |
 | **Distillation Pipeline** | Teacher–student training | Representation + behavioral transfer |
 
----
+- Smoke test (few episodes) for the VLM builder:
 
-## Roadmap
+```bash
+python pipeline.py --vlm-limit 2
+```
 
-- Reintroduce **Depth Fusion** with token-efficient integration  
-- Add **quantization-aware training** and fused-kernel inference paths  
-- Expand benchmarks to manipulation and navigation tasks  
-- Provide deployment scripts for Jetson Orin and other embedded boards  
+### Optional: enable VLM cross-attention context
 
----
+Provide VLM context directories (or a root to auto-discover) via config overrides:
 
-## Data Ethics and Transparency
+```bash
+python pretrain.py \
+  data_paths=[/abs/path/to/distill_out] \
+  vlm_context_root=/abs/path/to/vlm_embeddings \
+  global_batch_size=16 \
+  epochs=10
+```
 
-BabyGR00T follows a **Data Ethics Canvas** framework:
+## Outputs / logging
 
-- Clear data provenance and bias assessment  
-- Controlled sharing and anonymization  
-- Compliance with AI ethics and robotics data governance  
+- **Checkpoints + logs**: `pretrain.py` writes to `/workspace/outputs/<project>/<run_name>/...` by default (designed for Docker mounts).
+- **Metrics**: `train_metrics.jsonl` (JSONL, one line per step)
+- **Plots**: if `matplotlib` is available, plots are auto-generated next to `train_metrics.jsonl`.
 
-See `docs/data_ethics_canvas.md` for details.
+## Notes / known rough edges
 
----
+- **Docker is not plug-and-play in this snapshot**: `Dockerfile` expects a `grutito/` directory (a GR00T python package) which is not present here.
+- If you fix up the Docker image locally, `scripts/docker-run.sh distill` runs `gr00t_distiller.py` inside the container.
 
 ## Citation
 
+If you use this code, please cite the upstream works you build on (GR00T, TRM, NanoLLaVA) and clearly document your dataset provenance and distillation setup.
 If you use BabyGR00T in research or development, please cite:
 
 ```bibtex

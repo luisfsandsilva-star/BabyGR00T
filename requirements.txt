@@ -1,4 +1,7 @@
 torch
+numpy
+
+# Training / config
 lion-pytorch
 einops
 tqdm
@@ -8,13 +11,24 @@ argdantic
 wandb
 omegaconf
 hydra-core
+
+# Distillation / dataset I/O (mandatory for this repo’s pipeline)
 huggingface_hub
-packaging 
-ninja 
-wheel 
-setuptools 
+transformers
+accelerate
+pyarrow
+decord
+opencv-python
+pillow
+
+# Build / packaging
+packaging
+ninja
+wheel
+setuptools
 setuptools-scm
 pydantic-core
-huggingface_hub 
+
+# Optional perf / kernels
 numba
 triton

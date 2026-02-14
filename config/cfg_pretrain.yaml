@@ -25,6 +25,15 @@ lr: 1e-4
 lr_min_ratio: 1.0
 lr_warmup_steps: 2000
 
+# LR schedule: "linear" (warmup+decay) or "plateau" (ReduceLROnPlateau)
+lr_schedule: linear
+# Plateau scheduler settings (only used when lr_schedule: plateau)
+plateau_metric: mse
+plateau_factor: 0.5
+plateau_patience: 10
+plateau_threshold: 1e-4
+plateau_cooldown: 0
+
 # Standard hyperparameter settings for LM, as used in Llama
 beta1: 0.9
 beta2: 0.95
@@ -35,6 +44,12 @@ min_eval_interval: 0 # when to start the eval
 
 ema: False # use Exponential-Moving-Average
 ema_rate: 0.999 # EMA-rate
+
+# Optional: post-hoc stochastic weight averaging over saved checkpoints
+swa_enabled: False
+swa_num_checkpoints: 5
+swa_sample: True
+swa_seed: 0
 
 # VLM Context (optional - for cross-attention with vision-language embeddings)
 # Option 1: Provide explicit list of directories containing VLM .npz files

@@ -7,6 +7,7 @@ import shutil
 import copy
 import json
 import getpass
+import random
 
 import torch
 import torch.distributed as dist
@@ -78,6 +79,17 @@ class PretrainConfig(pydantic.BaseModel):
     lr: float
     lr_min_ratio: float
     lr_warmup_steps: int
+    # LR schedule selector:
+    #  - "linear": linear warmup (lr_warmup_steps) + linear decay to lr*lr_min_ratio over total_steps
+    #  - "plateau": ReduceLROnPlateau (proven standard), stepped on eval metric
+    lr_schedule: str = "linear"  # "linear" | "plateau"
+
+    # Plateau scheduler knobs (used when lr_schedule=="plateau")
+    plateau_metric: str = "mse"  # key from metrics_eval (e.g. "mse", "mae")
+    plateau_factor: float = 0.5
+    plateau_patience: int = 10
+    plateau_threshold: float = 1e-4
+    plateau_cooldown: int = 0
 
     weight_decay: float
     beta1: float
@@ -108,6 +120,28 @@ class PretrainConfig(pydantic.BaseModel):
     # VLM context directories (optional)
     vlm_context_dirs: List[str] = []  # Explicit list of VLM context directories
     vlm_context_root: Optional[str] = None  # Auto-discover VLM context under this root
+
+    # Optional: stochastic weight averaging over saved checkpoints (post-hoc)
+    swa_enabled: bool = False
+    swa_num_checkpoints: int = 5
+    swa_sample: bool = True
+    swa_seed: int = 0
+
+
+def get_default_device() -> torch.device:
+    # Training was originally CUDA-only; allow CPU runs for smoke tests / debugging.
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _to_device(x: Any, device: torch.device) -> Any:
+    if torch.is_tensor(x):
+        return x.to(device)
+    if isinstance(x, dict):
+        return {k: _to_device(v, device) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        seq = [_to_device(v, device) for v in x]
+        return type(x)(seq) if isinstance(x, tuple) else seq
+    return x
 
 @dataclass
 class TrainState:
@@ -304,6 +338,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
 
 
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+    device = get_default_device()
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
         batch_size=config.global_batch_size // world_size,
@@ -317,14 +352,16 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
 
-    with torch.device("cuda"):
-        model: nn.Module = model_cls(model_cfg)
+    model: nn.Module = model_cls(model_cfg)
+    model = model.to(device)
+    with torch.device(device.type):
         print(model)
         # Print parameter count for the base model
         num_params_base = sum(p.numel() for p in model.parameters())
         print(f"[Model] Base parameters: {num_params_base:,}")
 
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+        model = model.to(device)
         # Print total parameter count including loss head
         num_params_total = sum(p.numel() for p in model.parameters())
         print(f"[Model] Total parameters (with loss head): {num_params_total:,}")
@@ -446,10 +483,36 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
 
 def load_checkpoint(model: nn.Module, config: PretrainConfig):
     if config.load_checkpoint is not None:
-        print(f"Loading checkpoint {config.load_checkpoint}")
+        ckpt_path = config.load_checkpoint
+
+        # Convenience: allow config.load_checkpoint to be:
+        #  - a directory (pick newest step_*)
+        #  - "latest" (pick newest step_* within config.checkpoint_path)
+        if ckpt_path == "latest" and config.checkpoint_path is not None:
+            ckpt_path = config.checkpoint_path
+        if os.path.isdir(ckpt_path):
+            try:
+                candidates = []
+                for name in os.listdir(ckpt_path):
+                    if not name.startswith("step_"):
+                        continue
+                    try:
+                        step = int(name.split("step_")[1])
+                    except Exception:
+                        continue
+                    candidates.append((step, os.path.join(ckpt_path, name)))
+                if candidates:
+                    candidates.sort(key=lambda x: x[0])
+                    ckpt_path = candidates[-1][1]
+                    print(f"[Checkpoint] Resolved directory to latest: {ckpt_path}")
+            except Exception as e:  # noqa: BLE001
+                print(f"[Checkpoint] Failed to resolve directory checkpoint {ckpt_path}: {e}")
+
+        print(f"Loading checkpoint {ckpt_path}")
 
         # Load raw object (can be either a state_dict or a full training checkpoint)
-        loaded_obj = torch.load(config.load_checkpoint, map_location="cuda")
+        device = get_default_device()
+        loaded_obj = torch.load(ckpt_path, map_location=device)
 
         # Detect different checkpoint formats and extract the model state_dict
         if isinstance(loaded_obj, dict):
@@ -486,7 +549,8 @@ def load_train_state_if_available(config: PretrainConfig, train_state: TrainStat
 
     ckpt_path = config.load_checkpoint
     try:
-        checkpoint = torch.load(ckpt_path, map_location="cuda")
+        device = get_default_device()
+        checkpoint = torch.load(ckpt_path, map_location=device)
     except Exception as e:  # noqa: BLE001
         print(f"[Checkpoint] Failed to load full train state from {ckpt_path}: {e}")
         return train_state
@@ -514,44 +578,138 @@ def load_train_state_if_available(config: PretrainConfig, train_state: TrainStat
     return train_state
 
 
-def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
+def compute_lr_step(config: PretrainConfig, train_state: TrainState) -> float:
     """
-    Linear warmup + linear decay schedule (in *steps*), independent of base_lr:
-      - Warmup: from 5e-06 to 1e-03 over the first 1% of total_steps.
-      - Decay:  from 1e-03 back down to 5e-06 over the remaining 99%.
-    """
-    # Fixed endpoints requested by user
-    lr_start = 5e-6
-    lr_peak = 1e-3
-    lr_end = 5e-6
+    Step-based LR schedule.
 
+    - linear: warmup to config.lr over config.lr_warmup_steps, then decay to config.lr*config.lr_min_ratio.
+    - plateau: LR is managed by ReduceLROnPlateau (do not call this).
+    """
     total_steps = max(int(train_state.total_steps), 1)
-    warmup_steps = max(int(0.01 * total_steps), 1)
-    decay_steps = max(total_steps - warmup_steps, 1)
+    warmup_steps = max(int(config.lr_warmup_steps), 0)
+    base_lr = float(config.lr)
+    min_lr = float(config.lr) * float(config.lr_min_ratio)
 
-    # Clamp step to [1, total_steps] for scheduling purposes.
     step = int(train_state.step)
     if step < 1:
         step = 1
     if step > total_steps:
         step = total_steps
 
-    if warmup_steps == 1:
-        # Degenerate warmup: jump to peak on first step.
-        if step == 1:
-            return lr_peak
-    if step <= warmup_steps:
-        # Linear warmup: lr_start -> lr_peak
-        # step=1 -> lr_start, step=warmup_steps -> lr_peak
-        denom = max(warmup_steps - 1, 1)
-        t = (step - 1) / denom
-        return lr_start + t * (lr_peak - lr_start)
+    if warmup_steps > 0 and step <= warmup_steps:
+        return base_lr * (float(step) / float(max(1, warmup_steps)))
 
-    # Linear decay: lr_peak -> lr_end over [warmup_steps+1, total_steps]
-    if decay_steps <= 1:
-        return lr_end
-    t = (step - warmup_steps) / decay_steps
-    return lr_peak + t * (lr_end - lr_peak)
+    # Linear decay over remaining steps
+    denom = max(1, total_steps - warmup_steps)
+    t = float(step - warmup_steps) / float(denom)
+    return base_lr + t * (min_lr - base_lr)
+
+
+def create_plateau_scheduler(config: PretrainConfig, optimizer: torch.optim.Optimizer):
+    if config.lr_schedule != "plateau":
+        return None
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=float(config.plateau_factor),
+        patience=int(config.plateau_patience),
+        threshold=float(config.plateau_threshold),
+        cooldown=int(config.plateau_cooldown),
+        min_lr=float(config.lr) * float(config.lr_min_ratio),
+        verbose=True,
+    )
+
+
+def maybe_run_swa(config: PretrainConfig) -> None:
+    """
+    Post-hoc stochastic weight averaging over saved step_* checkpoints in config.checkpoint_path.
+    Writes `swa.pt` under the same directory.
+    """
+    if (not config.swa_enabled) or (config.checkpoint_path is None):
+        return
+
+    ckpt_dir = config.checkpoint_path
+    try:
+        files = [f for f in os.listdir(ckpt_dir) if f.startswith("step_")]
+    except Exception as e:  # noqa: BLE001
+        print(f"[SWA] Failed to list checkpoints under {ckpt_dir}: {e}")
+        return
+
+    def _parse_step(name: str) -> Optional[int]:
+        try:
+            return int(name.split("step_")[1])
+        except Exception:
+            return None
+
+    steps = [(f, _parse_step(f)) for f in files]
+    steps = [(f, s) for (f, s) in steps if s is not None]
+    steps.sort(key=lambda x: x[1])
+    if not steps:
+        print(f"[SWA] No step_* checkpoints found under {ckpt_dir}; skipping.")
+        return
+
+    n = max(1, int(config.swa_num_checkpoints))
+    # Pick a slightly larger tail window and sample from it (stochastic) if requested.
+    tail = steps[-max(n, 3 * n) :]
+    if config.swa_sample and len(tail) > n:
+        rng = random.Random(int(config.seed) + int(config.swa_seed))
+        chosen = rng.sample(tail, k=n)
+        chosen.sort(key=lambda x: x[1])
+    else:
+        chosen = tail[-n:]
+
+    print(f"[SWA] Averaging {len(chosen)} checkpoints...")
+    chosen_paths = [os.path.join(ckpt_dir, f) for (f, _s) in chosen]
+    chosen_steps = [int(s) for (_f, s) in chosen]
+
+    avg_sd: dict[str, torch.Tensor] = {}
+    counts: dict[str, int] = {}
+    non_float: dict[str, torch.Tensor] = {}
+
+    for path in chosen_paths:
+        ckpt = torch.load(path, map_location="cpu")
+        sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        if not isinstance(sd, dict):
+            print(f"[SWA] Unexpected checkpoint format at {path}; skipping.")
+            continue
+        for k, v in sd.items():
+            if not torch.is_tensor(v):
+                continue
+            if not v.is_floating_point():
+                # Keep first observed non-float tensors (buffers, counters, etc.)
+                non_float.setdefault(k, v)
+                continue
+            if k not in avg_sd:
+                avg_sd[k] = v.detach().to(torch.float32).clone()
+                counts[k] = 1
+            else:
+                avg_sd[k] += v.detach().to(torch.float32)
+                counts[k] += 1
+
+    if not avg_sd:
+        print("[SWA] No float parameters found to average; skipping.")
+        return
+
+    for k in list(avg_sd.keys()):
+        c = max(1, counts.get(k, 1))
+        avg_sd[k] = (avg_sd[k] / float(c)).to(torch.float32)
+
+    # Merge back non-float tensors
+    for k, v in non_float.items():
+        if k not in avg_sd:
+            avg_sd[k] = v
+
+    out_path = os.path.join(ckpt_dir, "swa.pt")
+    torch.save(
+        {
+            "model": avg_sd,
+            "swa_sources": chosen_paths,
+            "swa_steps": chosen_steps,
+            "swa_num": len(chosen_paths),
+        },
+        out_path,
+    )
+    print(f"[SWA] Wrote averaged weights to {out_path}")
 
 
 
@@ -571,7 +729,8 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
     # To device
-    batch = {k: v.cuda() for k, v in batch.items()}
+    device = get_default_device()
+    batch = _to_device(batch, device)
 
     # Init / reset carry if needed (e.g., batch size changed)
     batch_size = batch["inputs"].shape[0]
@@ -579,7 +738,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         train_state.carry is None
         or train_state.carry.halted.shape[0] != batch_size  # type: ignore[union-attr]
     ):
-        with torch.device("cuda"):
+        with torch.device(device.type):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
@@ -599,10 +758,13 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     # Apply optimizer
     lr_this_step = None    
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
-        lr_this_step = compute_lr(base_lr, config, train_state)
-
-        for param_group in optim.param_groups:
-            param_group['lr'] = lr_this_step
+        if config.lr_schedule != "plateau":
+            lr_this_step = compute_lr_step(config, train_state)
+            for param_group in optim.param_groups:
+                param_group['lr'] = lr_this_step
+        else:
+            # Plateau scheduler owns LR updates; just report current LR.
+            lr_this_step = float(optim.param_groups[0].get("lr", config.lr))
             
         optim.step()
         optim.zero_grad()
@@ -670,8 +832,9 @@ def evaluate(
                     eval_pbar.update(1)
             
             # To device
-            batch = {k: v.cuda() for k, v in batch.items()}
-            with torch.device("cuda"):
+            device = get_default_device()
+            batch = _to_device(batch, device)
+            with torch.device(device.type):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
             # Forward
@@ -707,7 +870,7 @@ def evaluate(
                     sorted(metrics.keys())
                 )  # Sort keys to guarantee all processes use the same order.
                 metric_values = torch.zeros(
-                    (len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda"
+                    (len(set_ids), len(metrics.values())), dtype=torch.float32, device=device
                 )
 
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
@@ -855,8 +1018,12 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
         if config.run_name is None:
             config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
 
-        # Save checkpoints to outputs directory (mounted from host)
-        base_ckpt_root = "/workspace/outputs"
+        # Save checkpoints under a portable root (works both inside and outside Docker).
+        # Priority:
+        #   1) $CHECKPOINT_ROOT
+        #   2) auto-discovered mount under /media/$USER
+        #   3) local ./checkpoints fallback
+        base_ckpt_root = _discover_checkpoint_root()
         # Preserve per-project/run substructure under outputs
         config.checkpoint_path = os.path.join(
             base_ckpt_root,
@@ -902,7 +1069,8 @@ def launch(hydra_config: DictConfig):
         RANK = dist.get_rank()
         WORLD_SIZE = dist.get_world_size()
 
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         
         # CPU GLOO process group
         CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
@@ -984,6 +1152,10 @@ def launch(hydra_config: DictConfig):
     # Progress bar and logger
     progress_bar = None
     ema_helper = None
+    lr_plateau_scheduler = None
+    # Create plateau scheduler on *all ranks* so LR stays consistent in DDP.
+    if config.lr_schedule == "plateau":
+        lr_plateau_scheduler = create_plateau_scheduler(config, train_state.optimizers[0])
     if RANK == 0:
         # Main training progress bar (steps)
         progress_bar = tqdm.tqdm(
@@ -1108,51 +1280,73 @@ def launch(hydra_config: DictConfig):
                 and config.eval_interval is not None
                 and (epoch + 1) >= (config.min_eval_interval or 0)
                 and (epoch + 1) % config.eval_interval == 0
-            ):
-                if RANK == 0:
-                    print(f"EVALUATE (epoch {epoch+1})")
-                if config.ema:
-                    print("SWITCH TO EMA")
-                    train_state_eval = copy.deepcopy(train_state)
-                    train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
-                else:
-                    train_state_eval = train_state
-                train_state_eval.model.eval()
-                metrics_eval = evaluate(
-                    config,
-                    train_state_eval,
-                    eval_loader,
-                    eval_metadata,
-                    evaluators,
-                    rank=RANK,
-                    world_size=WORLD_SIZE,
-                    cpu_group=CPU_PROCESS_GROUP,
-                )
+                ):
+                    if RANK == 0:
+                        print(f"EVALUATE (epoch {epoch+1})")
+                    if config.ema:
+                        print("SWITCH TO EMA")
+                        train_state_eval = copy.deepcopy(train_state)
+                        train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+                    else:
+                        train_state_eval = train_state
+                    train_state_eval.model.eval()
+                    metrics_eval = evaluate(
+                        config,
+                        train_state_eval,
+                        eval_loader,
+                        eval_metadata,
+                        evaluators,
+                        rank=RANK,
+                        world_size=WORLD_SIZE,
+                        cpu_group=CPU_PROCESS_GROUP,
+                    )
 
-                if RANK == 0 and metrics_eval is not None:
-                    # Optional wandb logging
-                    if config.use_wandb and wandb is not None and wandb.run is not None:
-                        wandb.log(metrics_eval, step=train_state.step)
+                    if RANK == 0 and metrics_eval is not None:
+                        # Optional wandb logging
+                        if config.use_wandb and wandb is not None and wandb.run is not None:
+                            wandb.log(metrics_eval, step=train_state.step)
 
-                    # Human-readable eval summary
-                    print(f"[Eval] epoch {epoch+1}, step {train_state.step}")
-                    for key, value in metrics_eval.items():
-                        # Metrics may be nested dicts (e.g., per split)
-                        if isinstance(value, dict):
-                            print(f"  {key}:")
-                            for sub_k, sub_v in value.items():
-                                print(f"    {sub_k}: {sub_v}")
-                        else:
-                            print(f"  {key}: {value}")
+                        # Human-readable eval summary
+                        print(f"[Eval] epoch {epoch+1}, step {train_state.step}")
+                        for key, value in metrics_eval.items():
+                            # Metrics may be nested dicts (e.g., per split)
+                            if isinstance(value, dict):
+                                print(f"  {key}:")
+                                for sub_k, sub_v in value.items():
+                                    print(f"    {sub_k}: {sub_v}")
+                            else:
+                                print(f"  {key}: {value}")
 
-                # Checkpointing on eval
-                if RANK == 0:
-                    print("SAVE CHECKPOINT")
-                if RANK == 0 and config.checkpoint_every_eval:
-                    save_train_state(config, train_state_eval)
+                    # Plateau scheduler step (prefer eval metric).
+                    # NOTE: metrics_eval is only populated on rank 0, so broadcast the scalar metric.
+                    if lr_plateau_scheduler is not None:
+                        metric_val = None
+                        if RANK == 0 and metrics_eval is not None:
+                            metric_key = str(config.plateau_metric)
+                            metric_val = metrics_eval.get(metric_key)
+                            if metric_val is None:
+                                metric_val = metrics_eval.get("mse", metrics_eval.get("mae"))
+                        try:
+                            metric_tensor = torch.tensor(
+                                [float(metric_val) if metric_val is not None else float("inf")],
+                                device="cuda",
+                                dtype=torch.float32,
+                            )
+                            if WORLD_SIZE > 1:
+                                dist.broadcast(metric_tensor, src=0)
+                            lr_plateau_scheduler.step(float(metric_tensor.item()))
+                        except Exception as e:  # noqa: BLE001
+                            if RANK == 0:
+                                print(f"[LR] Plateau scheduler step failed: {e}")
 
-                if config.ema and train_state_eval is not train_state:
-                    del train_state_eval
+                    # Checkpointing on eval
+                    if RANK == 0:
+                        print("SAVE CHECKPOINT")
+                    if RANK == 0 and config.checkpoint_every_eval:
+                        save_train_state(config, train_state_eval)
+
+                    if config.ema and train_state_eval is not train_state:
+                        del train_state_eval
 
 
     except KeyboardInterrupt:
@@ -1172,6 +1366,12 @@ def launch(hydra_config: DictConfig):
                 generate_plots_from_metrics(config.checkpoint_path)
             except Exception as e:  # noqa: BLE001
                 print(f"[Finalize] Failed to generate plots: {e}")
+
+            # Optional post-hoc SWA
+            try:
+                maybe_run_swa(config)
+            except Exception as e:  # noqa: BLE001
+                print(f"[SWA] Failed: {e}")
 
         # finalize distributed/wandb
         if dist.is_initialized():

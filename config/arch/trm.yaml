@@ -36,6 +36,14 @@ revin_apply_on_outputs: true
 # Cross-attention for VLM context
 cross_attn_enabled: true
 
+# Cross-attn optimization: fold context into self-attn by prepending tokens
+fold_cross_attn: true
+# Bound context tokens to keep attention + RoPE sizes reasonable
+max_cross_context_len: 64
+
+# Register tokens (learned tokens prepended near the prefix)
+register_tokens: 0
+
 pos_encodings: rope
 forward_dtype: bfloat16
 
