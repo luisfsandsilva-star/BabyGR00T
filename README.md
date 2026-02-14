@@ -43,6 +43,12 @@ python visual_embedding_builder.py \
   --device cuda \
   --resume
 ```
+**TRM (Tiny Recursive Model)**  
+A ~140M-parameter recursive reasoning model developed by Samsung SAIT Montréal.  
+It updates a latent state *z* and candidate output *y* through multiple refinement steps given input *x*, achieving high reasoning quality without large-scale architectures.
+
+**Encoder–Decoder Interface**  
+Encodes state and action tokens into TRM latents, then decodes refined latents back into next-state or action predictions, enabling closed-loop policy reasoning.
 
 This writes per-episode `.npz` files whose main array is typically:
 
@@ -101,6 +107,11 @@ Common variations:
 ```bash
 python pipeline.py --skip-vlm
 ```
+| Component | Role | Key Traits |
+|------------|------|------------|
+| **TRM** | Recursive reasoning | 140 M parameters · latent refinement · minimal compute |
+| **nanoLLaVA-1B** | Visual–language grounding | 1 B parameters · SigLIP encoder · edge-friendly |
+| **Distillation Pipeline** | Teacher–student training | Representation + behavioral transfer |
 
 - Smoke test (few episodes) for the VLM builder:
 
@@ -134,3 +145,28 @@ python pretrain.py \
 ## Citation
 
 If you use this code, please cite the upstream works you build on (GR00T, TRM, NanoLLaVA) and clearly document your dataset provenance and distillation setup.
+If you use BabyGR00T in research or development, please cite:
+
+```bibtex
+@article{munoz2025babygr00t,
+  title        = {BabyGR00T: Making Foundational Robotic Models Small, Fast, and Scalable},
+  author       = {Munoz, L. A.},
+  year         = {2025},
+  institution  = {Tec de Monterrey},
+  address      = {Monterrey, N.L., México}
+}
+```
+
+**Related Works**
+
+- Jolicoeur-Martineau, A. (2025). *Less is More: Recursive Reasoning with Tiny Networks (TRM).*  
+- Liu et al. (2024). *nanoLLaVA-1B: Compact Vision-Language Models for Edge AI.*
+- Bjorck et al. (2025). *GR00T N1: An Open Foundation Model for Generalist Humanoid Robots.*
+
+---
+
+## Acknowledgments
+
+Developed as part of the **BabyGR00T** research effort on efficient embodied intelligence.  
+Thanks to contributors from open-source projects on recursive reasoning (Samsung SAIT) and compact VLMs (nanoLLaVA team).  
+GR00T N1.5 model and datasets are referenced solely for academic distillation and benchmarking purposes.
