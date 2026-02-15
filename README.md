@@ -151,8 +151,8 @@ If you use BabyGR00T in research or development, please cite:
 @article{sandoval2025babygr00t,
   title  = {BabyGR00T: Making Foundational Robotic Models Small, Fast, and Scalable},
   author = {Sandoval, L. F. and Hernandez, A. and Podesta, M. O. and Nieto, N. and Munoz, L. A.},
-  year         = {2025},
-  institution  = {Tec de Monterrey},
+  year         = {2026},
+  institution  = {Minerva Labs},
   address      = {Monterrey, N.L., México}
 }
 ```
