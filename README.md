@@ -1,4 +1,4 @@
-# BabyGR00T (research code)
+# BabyGR00T: Making Foundational Robotic Models Small, Fast, and Scalable (work in progress)
 
 This repo contains a **teacher→student distillation pipeline** built around:
 
