@@ -6,6 +6,11 @@ This repo contains a **teacher→student distillation pipeline** built around:
 - **`pretrain.py` / `finetune.py`**: trains a **Tiny Recursive Reasoning Model (TRM)** to do **next-step latent prediction** (regression) on those `.npz` episodes.
 - **`visual_embedding_builder.py`** (optional): builds per-episode **VLM embeddings** (e.g. NanoLLaVA) that can be fed to TRM via **cross-attention** as extra context.
 
+- ## Example Cross-Attention Map
+
+![TRM Cross-Attention Map](assets/attn_map.jpeg)
+
+
 The goal is to experiment with making a smaller student learn to “track” a larger teacher’s internal representations. This codebase is **not** a turnkey deployment project.
 
 ## What’s in the repo
@@ -34,7 +39,7 @@ This package is not vendored in this repo yet, so you’ll need to install it se
 
 ## Step 1 — (Optional) Build VLM embedding context
 
-If you want TRM to attend over per-episode VLM embeddings, generate them first:
+If you want TRM to d over per-episode VLM embeddings, generate them first:
 
 ```bash
 python visual_embedding_builder.py \
@@ -119,7 +124,7 @@ python pipeline.py --skip-vlm
 python pipeline.py --vlm-limit 2
 ```
 
-### Optional: enable VLM cross-attention context
+### Optional: enable VLM cross-tion context
 
 Provide VLM context directories (or a root to auto-discover) via config overrides:
 
