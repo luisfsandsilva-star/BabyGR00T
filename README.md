@@ -153,9 +153,9 @@ If you use this code, please cite the upstream works you build on (GR00T, TRM, N
 If you use BabyGR00T in research or development, please cite:
 
 ```bibtex
-@article{sandoval2025babygr00t,
+@article{sandoval2026babygr00t,
   title  = {BabyGR00T: Making Foundational Robotic Models Small, Fast, and Scalable},
-  author = {Sandoval, L. F. and Hernandez, A. and Podesta, M. O. and Nieto, N. and Munoz, L. A.},
+  author = {Sandoval, L. F., Hernandez, A., Podesta, M. O., Nieto, N., Munoz, L. A.},
   year         = {2026},
   institution  = {Minerva Labs},
   address      = {Monterrey, N.L., México}
