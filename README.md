@@ -6,12 +6,33 @@ This repo contains a **teacher→student distillation pipeline** built around:
 - **`pretrain.py` / `finetune.py`**: trains a **Tiny Recursive Reasoning Model (TRM)** to do **next-step latent prediction** (regression) on those `.npz` episodes.
 - **`visual_embedding_builder.py`** (optional): builds per-episode **VLM embeddings** (e.g. NanoLLaVA) that can be fed to TRM via **cross-attention** as extra context.
 
-- ## Example Cross-Attention Map
+## Results & Visualizations
+
+### Preliminary RoboCasa Results
+
+Our distilled BabyGR00T model demonstrates promising performance on RoboCasa manipulation tasks, showing intent completion and decent preliminary results:
+
+![Preliminary RoboCasa Result](assets/preliminary_robocasa_result.gif)
+
+### Training Metrics
+
+The student model learns to predict teacher latents, as shown by the decreasing MSE loss over training steps:
+
+![Training MSE Loss](assets/train_mse.jpeg)
+
+The Q-halt loss stabilizes during training, indicating the model learns when to stop refining its latent representations:
+
+![Training Q-Halt Loss](assets/train_qhalt.jpeg)
+
+### Cross-Attention Visualization
+
+The TRM model attends to VLM-generated visual context through learned cross-attention patterns. This heatmap shows attention weights from head 0, revealing how different sequence positions attend to visual embedding tokens:
 
 ![TRM Cross-Attention Map](assets/attn_map.jpeg)
 
+---
 
-The goal is to experiment with making a smaller student learn to “track” a larger teacher’s internal representations. This codebase is **not** a turnkey deployment project.
+The goal is to experiment with making a smaller student learn to "track" a larger teacher's internal representations. This codebase is **not** a turnkey deployment project.
 
 ## What’s in the repo
 
