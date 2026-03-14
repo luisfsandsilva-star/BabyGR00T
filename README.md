@@ -1,7 +1,14 @@
 # BabyGR00T
 
 > **Efficient Vision-Language-Action Model via Selective Distillation and Lightweight Generative Architecture**
+> 
 > *Minerva Labs · Monterrey, N.L., México*
+> 
+> **Contact**
+> 
+> | **Luis Sandoval** | [luisfsandsilva@gmail.com](mailto:luisfsandsilva@gmail.com) · [LinkedIn](https://www.linkedin.com/in/luisfsandsilva/) |
+>
+> | **Alex Hernández** | [alexhergomz@gmail.com](mailto:alexhergomz@gmail.com) · [LinkedIn](https://www.linkedin.com/in/alexhergomz/) |
 
 <!-- TODO: add badge row once CI / HuggingFace card are live -->
 <!-- ![License](https://img.shields.io/badge/license-MIT-blue) ![Python](https://img.shields.io/badge/python-3.10+-blue) ![Hardware](https://img.shields.io/badge/hardware-SO--100-green) -->
