@@ -3,6 +3,10 @@
 > **Efficient Vision-Language-Action Model via Selective Distillation and Lightweight Generative Architecture**
 > 
 > *Minerva Labs · Monterrey, N.L., México*
+>
+> *VantTec · Monterrey, N.L., México*
+>
+> *RASTec · Monterrey, N.L., México*
 > 
 > **Contact**
 > 
@@ -209,9 +213,9 @@ If you use this code or build on this work, please cite the upstream works (GR00
 ```bibtex
 @article{sandoval2026babygr00t,
   title        = {BabyGR00T: Efficient Vision-Language-Action Model via Selective Distillation and Lightweight Generative Architecture},
-  author       = {Sandoval, L. F. and Hernandez, A. and Podesta, M. O. and Nieto, N. and Munoz, L. A.},
+  author       = {Sandoval, L. F. and Hernandez, A. and Podesta, M. O. and Nieto, N. and Mendez, E. and Hernandwez, E. and Munoz, L. A.},
   year         = {2026},
-  institution  = {Minerva Labs},
+  institution  = {Minerva Labs, VantTec, RASTec},
   address      = {Monterrey, N.L., México}
 }
 ```
