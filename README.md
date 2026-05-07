@@ -1,150 +1,262 @@
 # BabyGR00T
 
-> **Efficient Vision-Language-Action Model via Selective Distillation and Lightweight Generative Architecture**
-> 
+> **v0.5 (corrected) — Work in Progress**
+>
+> *Efficient Vision-Language-Action Model via Stabilized Recursive Action Generation*
+>
 > *Minerva Labs · Monterrey, N.L., México*
 >
 > *VantTec · Monterrey, N.L., México*
 >
 > *RASTec · Monterrey, N.L., México*
-> 
+>
 > **Contact**
-> 
+>
 > | **Luis Sandoval** | [luisfsandsilva@gmail.com](mailto:luisfsandsilva@gmail.com) · [LinkedIn](https://www.linkedin.com/in/luisfsandsilva/) |
 >
 > | **Alex Hernández** | [alexhergomz@gmail.com](mailto:alexhergomz@gmail.com) · [LinkedIn](https://www.linkedin.com/in/alexhergomz/) |
 
-<!-- TODO: add badge row once CI / HuggingFace card are live -->
-<!-- ![License](https://img.shields.io/badge/license-MIT-blue) ![Python](https://img.shields.io/badge/python-3.10+-blue) ![Hardware](https://img.shields.io/badge/hardware-SO--100-green) -->
+---
+
+> ⚠️ **Status: not finalized — testing under way.**
+> The pipeline (data → CQ-VAE → vision cache → policy → eval) runs end-to-end
+> and all four stages have been smoke-tested on real data, including a tiny
+> OXE subset (`lerobot/svla_so101_pickplace`, 1 episode, 18 chunks ×
+> 2 augmented variants, full InternVL3 + InternVL3 cache). Full-scale
+> training runs on the OXE-scale dataset are **not yet validated**.
+> Architecture, hyperparameter recipes, and APIs may still change.
+> Do not treat any number in this repo as a finalized result.
 
 ---
 
-## Overview
+## What this is
 
-BabyGR00T is a research initiative to train a capable, generalizable **Vision-Language-Action (VLA)** model at a fraction of the inference cost, parameter count, and training budget of current state-of-the-art embodied AI systems.
+BabyGR00T is a research effort toward a small, generalizable
+**Vision-Language-Action (VLA)** model — competitive manipulation in a
+form factor suitable for resource-constrained robotic platforms (target:
+single GPU, ≤16 GB VRAM, hours-not-days training).
 
-The core hypothesis is that a carefully designed small model — guided by *where* a large teacher looks, not *what* it predicts — can achieve competitive manipulation performance in a form factor suitable for resource-constrained robotic platforms.
+**v0.5 (corrected)** is a course-correction from the original v0.5
+formulation. The original plan (GR00T-teacher attention distillation +
+EVS/GAP visual pruning + RQ-VAE + TRM-MaskGIT) is documented under
+*Project history* below. After several training iterations we replaced
+the action codebook (RQ-VAE → 3-level CQ-VAE), removed the GR00T teacher
+distillation pathway, and replaced the swept TRM/MaskGIT decoder with a
+**stabilized recursive policy (S-TRM)** with split-stream Parcae
+contraction, Miyato spectral normalization, and outer-Parcae deep
+supervision. That model is what this repo currently implements.
 
-**Key ideas:**
-
-- **Selective attention distillation** — distill self-attention maps from GR00T N1.5/N1.6 (teacher), not trajectories or intermediate features, preserving BabyGR00T's architectural independence.
-- **Efficient visual token pruning** — EVS (temporally redundant patch removal) + GAP (positional-bias-corrected token selection) before the vision-language bridge.
-- **Discrete action generation** — actions are tokenized via RQ-VAE and decoded with a TRM-based MaskGIT-style iterative unmasker, replacing diffusion with a compact recursive architecture.
-- **Hardware-first validation** — primary evaluation on the LeRobot SO-100 arm, a low-cost open-source 6-DoF manipulator with native GR00T ecosystem support.
+The current model has been tested on the SO-101 78-episode dataset
+(`pavelsimo/SO-101-pick-and-place` + supplements). It is now being
+ported to the OXE-equivalent `lerobot/svla_so101_pickplace` to break the
+data-scarcity regime; that migration is underway.
 
 ---
 
-## Architecture
+## Repository layout
 
-BabyGR00T v0.5 is a six-module sequential inference pipeline:
+```
+babygroot_strm/        # importable package (~1300 LOC)
+├── cqvae.py           # RevIN, ActionRQUNet1d, VQ1d_EMA, cosine_snce_tau
+├── vision.py          # InternVL3Vision, LayerAggregator, PerceiverResampler
+├── policy.py          # STRMPolicy (current model)
+├── optimizer.py       # MuSGD_LARS (Muon-NS + LARS, no scalar coeff)
+├── data.py            # SO-101 + LeRobot/OXE streamers, ChunkDataset
+├── augment.py         # cache-time visual + LLM-prompt augmentation
+└── __init__.py
+scripts/               # four CLI entry points
+├── cache_vision.py    # extract InternVL3 features, w/ visual + prompt aug
+├── train_cqvae.py     # train the action codebook
+├── train_policy.py    # train the policy (default: v3 recipe)
+└── eval_policy.py     # H-scaling top-k accuracy + action-space MSE
+docs/
+├── ARCHITECTURE.md    # full S-TRM derivation
+└── RECIPES.md         # v3 / v4 / v5 recipes side-by-side
+assets/                # preliminary illustrations (see Project history)
+```
 
-![BabyGR00T Architecture](assets/babygr00t_arch.jpeg)
+---
 
-### Module summary
+## Architecture (current, S-TRM)
 
-| Module | Role | Status |
+A high-level summary follows; the full derivation is in
+`docs/ARCHITECTURE.md`.
+
+The policy joins three sources of information through cross-attention:
+
+```
+[ vis (128 latents) | state (1 token) ]      ←  cross-attn KV
+[ L0 (4) | L1 (8) | L2 (16) ]                ←  query stream (28 tokens)
+```
+
+It maintains **two latent streams** `x1, x2 ∈ ℝ^{B × 28 × d}` and runs a
+recursive update with deep supervision over the outer cycles:
+
+```
+inner step  (run L = 5 times):
+  x1 = Ā₁ ⊙ x1 + (1/L) F(x2 + y, kv)    F = SelfAttn ∘ CrossAttn (conv-combo)
+  x2 = Ā₂ ⊙ x2 + (1/L) G(x1 + y)        G = GeGLU FFN (conv-combo)
+
+outer step  (run H times, deep supervision per cycle):
+  logits = head(x1)
+  y      = Ā_H ⊙ y + (1/H) candidate(logits, mask, gt)
+```
+
+Stability mechanisms (all load-bearing — they let H be increased at eval
+without the recurrence diverging):
+
+- **Miyato spectral normalization** on every linear (`σ_max(W) = 1`).
+- **Parcae per-channel contraction** `Ā = exp(-|Δ|·exp(Ã)) ∈ (0,1)^d`,
+  initialized at target ρ values per stream.
+- **Convex-combo residual gates** `h ← (1-α)h + α·f(h)`, α ≈ 0.9 init.
+- **Softmax-1 attention sink** so heads can abstain cleanly.
+
+Action codebook: a **3-level convolutional CQ-VAE** (4 / 8 / 16 tokens,
+K=128 each), with RevIN normalization and EMA codebook updates.
+
+Vision: cached InternVL3-1B features (8-bit, frozen) + a learned
+LayerAggregator over the 25 LLM-layer hidden states + a Flamingo-style
+Perceiver resampler down to 128 latents.
+
+Optimizer: **MuSGD + LARS** — Muon-style Newton-Schulz orthogonalization
+on 2D weights, plain SGDM on 1D, per-parameter LARS trust ratio.
+
+---
+
+## Pipeline
+
+Four stages, each independent and resumable. See `docs/RECIPES.md` for
+full v3 / v4 / v5 commands.
+
+```bash
+# 1. Train the 3-level CQ-VAE on action chunks
+python -m scripts.train_cqvae --steps 5000
+
+# 2. Cache InternVL3 features for every chunk (one-time per dataset).
+#    Optional: --n-vis-aug N for cached visual augmentation,
+#              --llm-augment-prompts for LLM-paraphrased task prompts.
+python -m scripts.cache_vision --cache-dir vision_cache
+
+# 3. Train the policy (default = v3 recipe)
+python -m scripts.train_policy --steps 25000
+
+# 4. H-scaling eval — top-k accuracy + action-space MSE
+python -m scripts.eval_policy so101_strm.pt
+```
+
+### Cache-time augmentation
+
+Both forms run *once* during `cache_vision.py` so the training loop only
+pays the disk-read cost:
+
+| Flag | Default | Role |
+|---|---:|---|
+| `--n-vis-aug N` | 0 | Cache N visual variants per chunk (color jitter, blur, small crop). One transform applied identically to every frame in a chunk. |
+| `--llm-augment-prompts` | off | Generate paraphrases of every base task prompt via the Anthropic API (`claude-haiku-4-5`). Falls back to a built-in static bank if `ANTHROPIC_API_KEY` is unset. |
+| `--n-prompt-paraphrases K` | 20 | Size of the paraphrase pool per base prompt. |
+
+### Recipes (current — all unverified at scale)
+
+- **v3** — current default. depth=2, dim=768, L=5, H~U{1..12}, plain CE,
+  outer Parcae 1/H, mask curriculum, lr=9.5e-4. Best result so far on the
+  78-episode SO-101 set: probe mean 12.4 % (likely a memorization upper
+  bound — no held-out test split available at that data scale).
+- **v4** — v3 + small action-space MSE through the frozen CQ-VAE decoder
+  (expectation mode, all H cycles). The original v4 run with
+  `argmax-STE + final-cycle-only + β=0.1` was an anti-pattern (mse_pol
+  regressed); the corrected recipe uses smoother formulations.
+- **v5** — v3 architecture trained on `lerobot/svla_so101_pickplace`
+  (same SO-101 embodiment, ~50 episodes, ~12K frames). Migration code
+  exists and the cache pipeline has been validated on a 1-episode subset;
+  full-scale training has not run yet.
+
+---
+
+## Hardware platform
+
+Primary validation target: **LeRobot SO-100/SO-101** — low-cost
+open-source 6-DoF manipulators (5 arm joints + 1 gripper) with native
+support in the LeRobot dataset ecosystem. Datasets currently used or
+planned:
+
+- `pavelsimo/SO-101-pick-and-place` — original 78-ep set (action_dim=6)
+- `lerobot/svla_so101_pickplace` — OXE-style SO-101 (50 ep, in progress)
+- `lerobot/bridge_data_v2` — fallback if SO-101 OXE is too small
+  (60K trajectories, WidowX 6-DoF + gripper)
+
+---
+
+## Project history
+
+The four illustrations in `assets/` are from earlier iterations of this
+work and are kept for reference. They predate the current S-TRM design
+and **should not be read as evidence for the current model.**
+
+| Asset | What it shows | When |
 |---|---|---|
-| InternVL3-1B + EVS + GAP | Vision backbone with efficient token pruning | In scope — v0.5 |
-| Flamingo Perceiver Resampler | Vision-language bridge; distillation target | In scope — v0.5 |
-| RQ-VAE | Continuous → discrete action tokenization | In scope — v0.5 |
-| State Encoder | Encode proprioceptive states | In scope — v0.5 |
-| TRM-based MaskGIT Decoder | Compact recursive action generator | In scope — v0.5 |
----
+| `assets/babygr00t_arch.jpeg` | Six-module architecture diagram (InternVL3 + EVS/GAP + Resampler + RQ-VAE + State-encoder + TRM-MaskGIT) | Original v0.5 (superseded). |
+| `assets/preliminary_robocasa_result.gif/.mp4` | Drawer-opening demo on a RoboCasa simulation, early distillation pipeline | Pre-v0.5 PoC. |
+| `assets/train_mse.jpeg` | Student MSE descending during teacher-distillation training | Original v0.5 distillation pipeline. |
+| `assets/train_qhalt.jpeg` | Q-halt loss stabilizing during training | Original v0.5 (Q-halt was part of the swept-TRM ACT loop, dropped in S-TRM). |
+| `assets/attn_map.jpeg` | TRM attention heatmap over visual tokens | Original v0.5 attention analysis. |
 
-## Distillation Strategy
+### What changed from the original v0.5
 
-The GR00T teacher (SO-100 fine-tuned) runs in **inference-only mode** over the training demonstrations. We extract its **self-attention maps** and use them to supervise the resampler's attention heads.
+- **GR00T teacher distillation removed.** Attention-map distillation
+  proved difficult to operationalize end-to-end; the current model is
+  trained from scratch with no teacher.
+- **RQ-VAE → CQ-VAE.** The action codebook moved to a 3-level
+  convolutional VAE with EMA codebook + dead-code revival + RevIN
+  normalization. Smaller, easier to train, and provides a hierarchical
+  coarse→fine factorization that the policy exploits.
+- **Swept TRM / MaskGIT → S-TRM.** The recursive policy now has explicit
+  stability guarantees (Miyato spectral norm + Parcae contraction +
+  convex-combo residuals + 1/L · 1/H scaling). Empirically this lets the
+  same checkpoint use much larger H at eval than it was trained at,
+  which the swept TRM did not support.
+- **EVS/GAP token pruning dropped.** Cached InternVL3 features remove
+  the per-step compute pressure that motivated EVS in the first place.
+- **Q-halt + ACT loop dropped.** Replaced by deterministic H-cycle deep
+  supervision. The model trains with `H ~ Uniform{1..h_max}` so test-time
+  scaling is built into training rather than learned via Q-halt.
 
----
+The original v0.5 PoC (drawer opening on RoboCasa) is below for reference.
 
-## Training Pipeline
+### Original v0.5 — Preliminary RoboCasa demo
 
-Training consists of three sequential stages:
-
-**Stage 1 — RQ-VAE Pretraining**
-Pretrain the action tokenizer on the OXE action corpus and SO-100 teleoperation demonstrations. Output: frozen RQ-VAE encoder/decoder used in all subsequent stages.
-
-**Stage 2 — Attention Map Extraction**
-Run the GR00T SO-100 teacher in inference-only mode over task demonstrations. Extract and store self-attention maps as per-frame distillation targets. One-time offline pass; no teacher weights are updated.
-
-**Stage 3 — BabyGR00T Joint Training**
-
-Trained modules: Resampler (full), MaskGIT decoder (full), InternVL3-1B main weights.
-Frozen modules: RQ-VAE, GR00T teacher.
-
----
-
-## Hardware Platform: LeRobot SO-100
-
-Primary validation is conducted on the **LeRobot SO-100** — a low-cost, open-source 6-DoF manipulator (5 arm joints + 1 gripper) with native GR00T ecosystem support.
-
-**Why SO-100:**
-- Purpose-built for reproducible, low-cost robotics research
-- NVIDIA provides official fine-tuning scripts, data configs, and evaluation scripts for SO-100/SO-101 directly in the Isaac-GR00T repository
-- Native dual-camera support (front + wrist) in GR00T's data pipeline
-- Active community with published GR00T N1.5/N1.6 workflows as reference baselines
-
-### Target Tasks (v0.5)
-
-| Task | Difficulty | Description |
-|---|---|---|
-| Pick-and-place | Baseline | Grasp a specified object; place in a target container. Primary regression benchmark. |
-| Object sorting by visual attribute | Intermediate | Distinguish and sort by color or shape. Tests visual grounding and language conditioning. |
-| Precision placement | Stretch goal | Insert or stack objects requiring fine positional control. Tests RQ-VAE action resolution. |
-
-> The conference contribution is the **architecture and distillation method**, not task breadth. Task 3 is deferred if timeline does not allow it.
-
----
-
-## Roadmap
-
-| Milestone | Deliverable | Target |
-|---|---|---|
-| **v0.5** | Full pipeline on SO-100, ablation on 2–3 tasks, GR00T baseline comparison | Conference submission (2–3 months from kickoff) |
-| **v1.0** | Isaac Sim data augmentation, broader task coverage | Post-submission |
-| **v1.5** | Cross-embodiment evaluation | Follow-up work |
-| **v2.0** | Dreamer-style world model, RL fine-tuning on hardware, larger embodiment coverage | Future work |
-
-## Proof of Concept
-
-The following results were obtained on **RoboCasa simulation** during early pipeline development, prior to the v0.5 hardware validation milestone. They validate the teacher→student distillation plumbing and confirm that the TRM student begins learning from GR00T latents. Task performance at this stage is limited — the model was able to open a drawer — but the training signal and attention structure are working as intended.
-
-> **Note:** These are preliminary results on the simulation environment, not the v0.5 evaluation target. Hardware results on the SO-100 are forthcoming.
-
-### Manipulation Demo
-
-<!-- TODO: replace with SO-100 hardware demo when available -->
-
-Early distillation run on a RoboCasa drawer-opening task. Task completion is limited at this stage; the goal here is to validate the pipeline, not claim task performance:
+Early distillation run, drawer-opening task. Task completion is limited;
+the goal of this artifact is to validate the (then-current) distillation
+pipeline, not claim performance.
 
 ![Preliminary RoboCasa Result](assets/preliminary_robocasa_result.gif)
 
-### Training Metrics
+### Original v0.5 — Training metrics
 
-Student MSE loss decreasing over training steps, confirming the model is learning to predict teacher latents:
+Student MSE loss (left) and Q-halt loss (right) from the original
+distillation pipeline. Both metrics belong to the v0.5 model superseded
+by S-TRM and **do not characterize the current architecture**.
 
-![Training MSE Loss](assets/train_mse.jpeg)
+| MSE | Q-halt |
+|---|---|
+| ![Training MSE Loss](assets/train_mse.jpeg) | ![Training Q-Halt Loss](assets/train_qhalt.jpeg) |
 
-Q-halt loss stabilizing during training, indicating the model learns when to stop refining its latent representations:
+### Original v0.5 — Attention visualization
 
-![Training Q-Halt Loss](assets/train_qhalt.jpeg)
-
-### Self-Attention Visualization
-
-Attention heatmap showing how the TRM attends to VLM-generated visual context across sequence positions and visual embedding tokens (head 0):
-
-<!-- TODO: add annotation showing which visual regions are attended to -->
+Self-attention map from the original swept-TRM model (head 0). The
+current S-TRM model does not have a Q-halt loop and uses a different
+attention sink (softmax-1), so this map is illustrative only.
 
 ![TRM Self-Attention Map](assets/attn_map.jpeg)
 
+---
 
 ## Setup
 
 ### Requirements
 
 - Python 3.10+
-- CUDA-capable GPU (~16 GB VRAM recommended)
-- GR00T N1.5 or N1.6 checkpoint (for teacher attention map extraction)
+- CUDA-capable GPU (~6 GB VRAM at v3 defaults; ~12 GB+ for larger configs)
+- For LLM-prompt augmentation (optional): `ANTHROPIC_API_KEY` env var
 
 ### Installation
 
@@ -152,69 +264,49 @@ Attention heatmap showing how the TRM attends to VLM-generated visual context ac
 python -m venv venv
 source venv/bin/activate
 pip install -U pip setuptools wheel
-pip install -r requirements.txt
+pip install -e .
 ```
 
-### GR00T teacher dependency
-
-`distillation/gr00t_distiller.py` requires `gr00t.model.policy.Gr00tPolicy`. Install from the Isaac-GR00T repository:
+### Smoke test
 
 ```bash
-# Follow NVIDIA's official Isaac-GR00T setup:
-# https://github.com/NVIDIA/Isaac-GR00T
+python -c "
+import torch
+from babygroot_strm import STRMPolicy, SEQ_LENS_1D, NUM_RESAMPLER_LATENTS
+m = STRMPolicy(seq_lens=tuple(SEQ_LENS_1D), k_codebook=128,
+               dim=128, depth=2, L_inner=2, H_outer=2, state_dim=6,
+               max_prefix=NUM_RESAMPLER_LATENTS+16,
+               grad_checkpoint=False)
+print(f'params: {sum(p.numel() for p in m.parameters())/1e6:.2f}M')
+"
 ```
 
 ---
 
-## Quickstart
+## Roadmap (subject to change)
 
-### Stage 1 — Pretrain RQ-VAE
-
-```bash
-python training/pretrain.py \
-  data_paths=[/path/to/oxe_data,/path/to/so100_demos] \
-  global_batch_size=16 \
-  epochs=20
-```
-
-### Stage 2 — Extract GR00T attention maps
-
-```bash
-python distillation/gr00t_distiller.py \
-  --model nvidia/GR00T-N1.5-3B \
-  --embodiment so100 \
-  --out /path/to/attn_maps
-```
-
-### Stage 3 — Train BabyGR00T
-
-```bash
-python training/train.py \
-  data_paths=[/path/to/so100_demos] \
-  attn_map_root=/path/to/attn_maps \
-  global_batch_size=16 \
-  epochs=50
-```
-
-### One-command pipeline runner
-
-```bash
-python pipeline.py \
-  --train-epochs 50 \
-  --train-global-batch-size 16
-```
+| Milestone | Deliverable | Status |
+|---|---|---|
+| **v0.5 corrected** (this repo) | S-TRM v3 pipeline end-to-end on SO-101 78-ep + tiny OXE smoke test | **Code complete, training runs underway.** |
+| v0.5 OXE | Full v3 retrain on `lerobot/svla_so101_pickplace`, with held-out test split | Not started — code path validated only. |
+| v1.0 | Hardware deployment (SO-101), real-task evaluation | Future. |
+| v1.5 | Cross-embodiment evaluation (BridgeData V2 / Fractal20220817) | Future. |
+| v2.0 | World-model augmentation, RL fine-tuning | Future. |
 
 ---
 
 ## Citation
 
-If you use this code or build on this work, please cite the upstream works (GR00T, TRM, InternVL3, EVS, GAP) and document your dataset provenance and distillation setup.
+This work is unfinished and not yet ready for citation. The citation
+block below is a placeholder; numbers and methodology will change as
+training runs complete.
 
 ```bibtex
-@article{sandoval2026babygr00t,
-  title        = {BabyGR00T: Efficient Vision-Language-Action Model via Selective Distillation and Lightweight Generative Architecture},
-  author       = {Sandoval, L. F. and Hernandez, A. and Podesta, M. O. and Nieto, N. and Mendez, E. and Hernandwez, E. and Munoz, L. A.},
+@misc{sandoval2026babygr00t,
+  title        = {BabyGR00T v0.5 (corrected): A Stabilized Recursive Vision-Language-Action Model},
+  author       = {Sandoval, L. F. and Hernández, A.},
   year         = {2026},
+  note         = {Work in progress.},
   institution  = {Minerva Labs, VantTec, RASTec},
   address      = {Monterrey, N.L., México}
 }
@@ -227,17 +319,31 @@ If you use this code or build on this work, please cite the upstream works (GR00
 - Alayrac et al. (2022). *Flamingo: a Visual Language Model for Few-Shot Learning.* NeurIPS 2022.
 - Chang et al. (2022). *MaskGIT: Masked Generative Image Transformer.* CVPR 2022.
 - Chen et al. (2024). *InternVL / InternVL3: Scaling up Vision Foundation Models.* arXiv 2024.
-- Hao et al. (2025). *EVS: Efficient Video Sampling.* arXiv:2510.14624.
-- Jolicoeur-Martineau, A. (2025). *Less is More: Recursive Reasoning with Tiny Networks (TRM).* Samsung SAIL Montreal. arXiv:2510.04871.
+- Gu & Dao (2024). *Mamba: Linear-Time Sequence Modeling with Selective State Spaces.*
+- Jolicoeur-Martineau (2025). *Less is More: Recursive Reasoning with Tiny Networks (TRM).* arXiv:2510.04871.
+- Jordan et al. (2024). *Muon: Momentum-Orthogonalized Updates.*
+- Kim et al. (2022). *Reversible Instance Normalization for Accurate Time-Series Forecasting.* ICLR 2022.
 - Lee et al. (2022). *Autoregressive Image Generation using Residual Quantization (RQ-VAE).* CVPR 2022.
+- Miller (2023). *Attention Is Off By One.* (softmax-1 attention sink)
+- Miyato et al. (2018). *Spectral Normalization for Generative Adversarial Networks.*
 - NVIDIA (2025). *Isaac GR00T N1 / N1.5 / N1.6.* HuggingFace: `nvidia/GR00T-N1.5-3B`, `nvidia/GR00T-N1.6-3B`.
 - O'Neill et al. / Padalkar et al. (2023–2024). *Open X-Embodiment: Robotic Learning Datasets and RT-X Models.* ICRA 2024.
-- Sun et al. (2019). *Patient Knowledge Distillation for BERT Compression (PKD).* EMNLP 2019.
+- Shazeer (2020). *GLU Variants Improve Transformer.*
+- You et al. (2017). *LARS: Large Batch Training of CNNs with Layer-wise Adaptive Rate Scaling.*
 
 ---
 
 ## Acknowledgments
 
-Developed as part of the **BabyGR00T** research effort on efficient embodied intelligence at Minerva Labs, Monterrey, México.
-Thanks to Samsung SAIL Montreal (TRM), the InternVL team, the LeRobot / HuggingFace community, and NVIDIA Research for open-sourcing Isaac GR00T.
-GR00T N1.5/N1.6 models and datasets are referenced solely for academic distillation and benchmarking purposes.
+Developed as part of the **BabyGR00T** research effort on efficient
+embodied intelligence at Minerva Labs, Monterrey, México. Thanks to
+Samsung SAIL Montreal (TRM), the InternVL team, the LeRobot / HuggingFace
+community, and NVIDIA Research for open-sourcing Isaac GR00T. GR00T
+N1.5/N1.6 models and datasets are referenced solely for academic
+comparison purposes.
+
+---
+
+## License
+
+MIT.

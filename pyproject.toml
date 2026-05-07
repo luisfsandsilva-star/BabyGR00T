@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "babygroot_strm"
+version = "0.1.0"
+description = "S-TRM v3: stabilized recursive policy over a 3-level CQ-VAE for SO-101 manipulation."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.24",
+    "Pillow>=10.0",
+    "av>=11.0",
+    "psutil>=5.9",
+    "datasets>=2.16",
+    "huggingface_hub>=0.20",
+    "transformers>=4.40",
+    "bitsandbytes>=0.43",
+    "accelerate>=0.30",
+    "anthropic>=0.40",
+]
+
+[tool.setuptools.packages.find]
+include = ["babygroot_strm*"]

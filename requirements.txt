@@ -1,34 +1,11 @@
-torch
-numpy
-
-# Training / config
-lion-pytorch
-einops
-tqdm
-coolname
-pydantic
-argdantic
-wandb
-omegaconf
-hydra-core
-
-# Distillation / dataset I/O (mandatory for this repo’s pipeline)
-huggingface_hub
-transformers
-accelerate
-pyarrow
-decord
-opencv-python
-pillow
-
-# Build / packaging
-packaging
-ninja
-wheel
-setuptools
-setuptools-scm
-pydantic-core
-
-# Optional perf / kernels
-numba
-triton
+torch>=2.2
+numpy>=1.24
+Pillow>=10.0
+av>=11.0
+psutil>=5.9
+datasets>=2.16
+huggingface_hub>=0.20
+transformers>=4.40
+bitsandbytes>=0.43
+accelerate>=0.30
+anthropic>=0.40

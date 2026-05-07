@@ -1,44 +1,23 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
 *.egg-info/
-dist/
+.eggs/
 build/
+dist/
+.pytest_cache/
 
-# PyTorch
-*.pth
+# Caches & checkpoints (large)
+vision_cache/
 *.pt
-*.ckpt
-
-# Data and outputs
+*.bin
 data/
-!Gr00tPolicy/**/data/
-outputs/
-checkpoints/
-attention_prints/
-assets/
-GR00T_N1.5/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Docker
-*.deb
 
 # Logs
 *.log
-DOCKER.md
+hparam_log.jsonl
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
