@@ -108,19 +108,15 @@ python -m scripts.train_cqvae \
   --ckpt-path oxe_vae_revin.pt
 
 # 2. Re-build the InternVL3 vision cache for OXE.
-#    With visual + prompt augmentation: each chunk gets 1 original + 3
-#    photometrically-jittered variants; each variant uses a different
-#    paraphrased task prompt drawn from a 25-prompt LLM-generated pool.
-#    Both forms of augmentation run ONCE here — training reads from disk.
 #    `lerobot/svla_so101_pickplace` cameras are `observation.images.up` and
 #    `observation.images.side` (not `front`); pick one.
+#    `--n-vis-aug 0` for a fast first pass; bump it later for more diversity.
 python -m scripts.cache_vision \
   --dataset oxe \
   --oxe-dataset-id lerobot/svla_so101_pickplace \
   --oxe-camera observation.images.up \
   --cache-dir oxe_vision_cache \
-  --n-vis-aug 3 \
-  --llm-augment-prompts --n-prompt-paraphrases 25
+  --n-vis-aug 0
 
 # 3. Train v5: identical hyperparameters to v3, only the data path differs.
 python -m scripts.train_policy \
@@ -138,31 +134,20 @@ python -m scripts.train_policy \
 different action dimensionality, also pass `--action-dim <d>` to
 `train_cqvae.py`.
 
-### Cache-time augmentation (recommended for OXE)
+### Cache-time augmentation
 
-Two flavors, both applied once during `cache_vision.py`:
+**Visual augmentation** (`--n-vis-aug N`, default 0 = off): per chunk, sample
+N additional sets of photometric + blur + small-crop parameters and re-run
+InternVL3 with each. The transform is consistent across all frames in one
+chunk so the temporal coherence is preserved (no flickering inside a clip).
+Augmented features land in the same per-episode file; `ChunkDataset` samples
+uniformly across variants when `augment=True`. Recommended for a second pass
+once the un-augmented v5 baseline is established.
 
-**Visual augmentation** (`--n-vis-aug N`): per chunk, sample N additional sets
-of photometric+blur+crop parameters and re-run InternVL3 with each. The
-transform is consistent across all frames in one chunk so the temporal
-coherence is preserved (no flickering inside a clip). Augmented features land
-in the same per-episode file; `ChunkDataset` samples uniformly across
-variants when `augment=True`.
-
-**Prompt augmentation** (`--llm-augment-prompts --n-prompt-paraphrases K`):
-build a K-paraphrase pool per unique task prompt by calling the Anthropic
-API once per prompt (cheap — O(unique prompts), not O(chunks)). Each cached
-variant draws a random paraphrase from the pool, so InternVL3 sees prompt
-diversity. The script falls back to a hand-curated static bank if
-`ANTHROPIC_API_KEY` is unset, so it works offline too.
-
-The combination is what gives the cache real diversity: one chunk with
-N visual variants × 1 prompt each is much weaker than N visual variants ×
-N different prompts. Use both together.
-
-For BridgeData V2 (or any non-SO-101 dataset) you'll want a richer paraphrase
-bank than the built-in one — set `--llm-augment-prompts` and let the LLM
-write task-specific paraphrases.
+**Prompt sampling** (always on, no flag): each chunk-variant draws a
+paraphrase from a built-in `PARAPHRASE_BANK` so InternVL3 sees prompt-level
+diversity with zero external dependency. The bank covers pick-and-place and
+red-cube-to-bowl phrasings; extend `babygroot_strm/augment.py` for new tasks.
 
 ### Held-out test split
 

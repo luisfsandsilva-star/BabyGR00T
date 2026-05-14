@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pre-compute and cache InternVL3 hidden states for every (episode, chunk).
 
-Two augmentation knobs (both off by default — pass flags to enable):
+Optional visual augmentation (off by default):
 
   --n-vis-aug N
       For each chunk, additionally cache N augmented variants. Each variant
@@ -10,12 +10,9 @@ Two augmentation knobs (both off by default — pass flags to enable):
       so temporal coherence is preserved. The augmented features go through
       InternVL3 ONCE here — the training loop only pays the disk-read cost.
 
-  --llm-augment-prompts (+ --n-prompt-paraphrases K)
-      Generate K paraphrases of every base task prompt via the Anthropic API
-      (claude-haiku-4-5 by default). Each cached variant draws a random
-      paraphrase from this pool, so the LLM and the policy see prompt-level
-      diversity. Falls back to a static paraphrase bank if the API key isn't
-      set or the SDK isn't installed.
+Prompt sampling: every chunk-variant draws a paraphrase from a static bank
+(see babygroot_strm.augment.PARAPHRASE_BANK) so InternVL3 sees mild prompt
+diversity without any external API dependency.
 
 Output layout per episode:
     ep_NNN.pt = list of (q_int8, scales_fp16) entries, length n_chunks*(1+n_vis_aug):
@@ -30,15 +27,15 @@ meta.json carries:
     paraphrase_pool: { base_prompt: [paraphrase, ...] }
 
 Usage:
-  # plain (no augmentation; matches the old behavior):
+  # plain (no augmentation):
   python -m scripts.cache_vision --cache-dir vision_cache
 
-  # OXE with 3 visual variants per chunk + LLM-augmented prompts:
+  # OXE with 3 visual variants per chunk:
   python -m scripts.cache_vision \
       --dataset oxe --oxe-dataset-id lerobot/svla_so101_pickplace \
+      --oxe-camera observation.images.up \
       --cache-dir oxe_vision_cache \
-      --n-vis-aug 3 \
-      --llm-augment-prompts --n-prompt-paraphrases 25
+      --n-vis-aug 3
 """
 import os, sys, gc, time, random, argparse, json
 
@@ -69,17 +66,17 @@ def main():
                          "lerobot/svla_so101_pickplace, the v5 target).")
     ap.add_argument('--oxe-dataset-id', type=str,
                     default='lerobot/svla_so101_pickplace')
-    ap.add_argument('--oxe-camera', type=str, default='observation.images.front')
+    ap.add_argument('--oxe-camera', type=str, default='observation.images.up',
+                    help="Camera video key inside the LeRobot dataset. "
+                         "lerobot/svla_so101_pickplace cameras are "
+                         "`observation.images.up` and `.side`.")
     ap.add_argument('--data-dir', default=None,
                     help="Local SO-101 dataset dir (only used for --dataset=so101).")
     # Augmentation
     ap.add_argument('--n-vis-aug', type=int, default=0,
                     help="Augmented vision variants per chunk (0 = off).")
-    ap.add_argument('--llm-augment-prompts', action='store_true',
-                    help="Use the Anthropic API to paraphrase task prompts.")
     ap.add_argument('--n-prompt-paraphrases', type=int, default=20,
-                    help="How many paraphrases per base prompt to generate.")
-    ap.add_argument('--llm-model', default='claude-haiku-4-5')
+                    help="Pool size of paraphrases sampled from the static bank.")
     # Sub-sampling for testing
     ap.add_argument('--n-eps-cap', type=int, default=None,
                     help="Cap episodes processed (useful for smoke tests).")
@@ -110,20 +107,15 @@ def main():
     print(f"  {len(episodes)} episodes, {total_chunks} chunks  "
           f"(variants per chunk: {n_variants})")
 
-    # ── Build the paraphrase pool (one query per unique base prompt) ──
-    base_prompts = []
-    for (_, _, _, task) in episodes:
-        base_prompts.append(task)
+    # ── Build the paraphrase pool from the static bank ──
+    base_prompts = [task for (_, _, _, task) in episodes]
     print(f"\nBuilding paraphrase pool over {len(set(base_prompts))} unique "
-          f"base prompts (use_llm={args.llm_augment_prompts}) ...")
-    paraphrase_pool = build_paraphrase_pool(
-        base_prompts,
-        n=args.n_prompt_paraphrases,
-        use_llm=args.llm_augment_prompts,
-        model=args.llm_model,
-    )
+          f"base prompts (static bank) ...")
+    paraphrase_pool = build_paraphrase_pool(base_prompts,
+                                             n=args.n_prompt_paraphrases)
     for bp, plist in list(paraphrase_pool.items())[:3]:
-        print(f"  '{bp[:50]}' → {len(plist)} paraphrases  (sample: {plist[0][:50]!r})")
+        print(f"  '{bp[:50]}' → {len(plist)} paraphrases  "
+              f"(sample: {plist[0][:50]!r})")
 
     print(f"\nCaching to {args.cache_dir}/")
     t0 = time.perf_counter(); total_bytes = 0
@@ -172,7 +164,7 @@ def main():
         print(f"  ep {ep_i:3d}/{len(episodes)}  chunks={n_chunks:3d}  "
               f"variants={n_variants}  "
               f"size={size/1e6:.0f}MB  total={total_bytes/1e9:.1f}GB  "
-              f"RAM={ram:.1f}GB  [{elapsed:.0f}s]")
+              f"RAM={ram:.1f}GB  [{elapsed:.0f}s]", flush=True)
         if (ep_i + 1) % 5 == 0:
             gc.collect(); torch.cuda.empty_cache()
 

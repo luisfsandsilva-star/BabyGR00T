@@ -10,9 +10,8 @@ from .data import (load_so101_episodes, load_lerobot_episodes,
                    SO101Streamer, ChunkDataset,
                    make_loader, chunk_collate, OUNoise,
                    load_vision_cache, TASK_PROMPTS, SUPPLEMENT_PROMPTS)
-from .augment import (visual_augment_chunk, build_paraphrase_pool,
-                      paraphrase_prompts_with_llm, paraphrase_prompts_fallback,
-                      PARAPHRASE_BANK)
+from .augment import (visual_augment_chunk, sample_paraphrases,
+                      build_paraphrase_pool, PARAPHRASE_BANK)
 
 __all__ = [
     "RevIN", "ActionRQUNet1d", "VQ1d_EMA", "cosine_snce_tau", "SEQ_LENS_1D",
@@ -23,7 +22,6 @@ __all__ = [
     "SO101Streamer", "ChunkDataset", "make_loader",
     "chunk_collate", "OUNoise", "load_vision_cache",
     "TASK_PROMPTS", "SUPPLEMENT_PROMPTS",
-    "visual_augment_chunk", "build_paraphrase_pool",
-    "paraphrase_prompts_with_llm", "paraphrase_prompts_fallback",
-    "PARAPHRASE_BANK",
+    "visual_augment_chunk", "sample_paraphrases",
+    "build_paraphrase_pool", "PARAPHRASE_BANK",
 ]

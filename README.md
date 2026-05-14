@@ -133,8 +133,7 @@ full v3 / v4 / v5 commands.
 python -m scripts.train_cqvae --steps 5000
 
 # 2. Cache InternVL3 features for every chunk (one-time per dataset).
-#    Optional: --n-vis-aug N for cached visual augmentation,
-#              --llm-augment-prompts for LLM-paraphrased task prompts.
+#    Optional: --n-vis-aug N for cached visual augmentation.
 python -m scripts.cache_vision --cache-dir vision_cache
 
 # 3. Train the policy (default = v3 recipe)
@@ -146,14 +145,13 @@ python -m scripts.eval_policy so101_strm.pt
 
 ### Cache-time augmentation
 
-Both forms run *once* during `cache_vision.py` so the training loop only
-pays the disk-read cost:
+Optional knob (off by default) — runs once during `cache_vision.py` so the
+training loop only pays the disk-read cost:
 
 | Flag | Default | Role |
 |---|---:|---|
 | `--n-vis-aug N` | 0 | Cache N visual variants per chunk (color jitter, blur, small crop). One transform applied identically to every frame in a chunk. |
-| `--llm-augment-prompts` | off | Generate paraphrases of every base task prompt via the Anthropic API (`claude-haiku-4-5`). Falls back to a built-in static bank if `ANTHROPIC_API_KEY` is unset. |
-| `--n-prompt-paraphrases K` | 20 | Size of the paraphrase pool per base prompt. |
+| `--n-prompt-paraphrases K` | 20 | Pool size of paraphrases sampled from the built-in static bank; each variant draws one paraphrase from the pool. |
 
 ### Recipes (current — all unverified at scale)
 
@@ -256,7 +254,6 @@ attention sink (softmax-1), so this map is illustrative only.
 
 - Python 3.10+
 - CUDA-capable GPU (~6 GB VRAM at v3 defaults; ~12 GB+ for larger configs)
-- For LLM-prompt augmentation (optional): `ANTHROPIC_API_KEY` env var
 
 ### Installation
 

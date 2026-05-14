@@ -201,14 +201,11 @@ happens at *cache* time, not training time. Two complementary forms (see
   per (chunk, variant) is applied identically to every frame in that chunk —
   temporal coherence inside a clip is preserved (no flickering), but
   different variants of the same chunk see different lighting/blur.
-- **Prompt:** each variant uses a different paraphrase of the task prompt,
-  drawn from a per-base-prompt paraphrase pool. The pool is generated once
-  per unique prompt — either by the Anthropic API
-  (`paraphrase_prompts_with_llm`, default model `claude-haiku-4-5`) or from
-  the static `PARAPHRASE_BANK` if no API key is available. InternVL3 sees
-  prompt-level diversity *in addition to* visual diversity, so the cached
+- **Prompt:** each variant draws a paraphrase of the task prompt from the
+  built-in `PARAPHRASE_BANK` in `babygroot_strm/augment.py`. InternVL3 sees
+  prompt-level diversity in addition to visual diversity, so the cached
   features cover a wider stretch of the (image, instruction) joint
-  distribution.
+  distribution. Extend the bank for new tasks.
 
 `ChunkDataset(augment=True)` samples one variant per `__getitem__`; with
 N visual variants × N prompts the effective dataset size is `n_chunks ×
