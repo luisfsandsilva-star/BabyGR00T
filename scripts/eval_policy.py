@@ -23,7 +23,8 @@ import torch
 from babygroot_strm import (RevIN, ActionRQUNet1d, VQ1d_EMA,
                             LayerAggregator, PerceiverResampler,
                             STRMPolicy,
-                            load_so101_episodes, make_loader,
+                            load_so101_episodes, load_lerobot_episodes,
+                            make_loader,
                             NUM_RESAMPLER_LATENTS, VIS_HIDDEN_DIM, SEQ_LENS_1D)
 
 
@@ -48,8 +49,9 @@ def main():
     trained_depth = c.get('depth',   2)
     trained_dim   = c.get('dim',     768)
     rho1 = c.get('rho1', 0.75); rho2 = c.get('rho2', 0.65); rho_H = c.get('rho_H', 0.85)
+    state_dim = c.get('state_dim', c.get('action_dim', 6))
     print(f"  trained: depth={trained_depth} dim={trained_dim} L={trained_L} "
-          f"H={trained_H} ρ1={rho1} ρ2={rho2} ρ_H={rho_H}")
+          f"H={trained_H} ρ1={rho1} ρ2={rho2} ρ_H={rho_H}  state_dim={state_dim}")
 
     print(f"Loading frozen CQ-VAE from {args.vae_ckpt} ...")
     vck = torch.load(args.vae_ckpt, map_location=device, weights_only=False)
@@ -66,7 +68,7 @@ def main():
         dim=trained_dim, heads=8, depth=trained_depth,
         L_inner=trained_L, H_outer=trained_H,
         rho1_target=rho1, rho2_target=rho2, rho_H_target=rho_H,
-        max_prefix=NUM_RESAMPLER_LATENTS + 16, state_dim=action_dim,
+        max_prefix=NUM_RESAMPLER_LATENTS + 16, state_dim=state_dim,
     ).to(device)
     aggregator.load_state_dict(c['aggregator'])
     resampler.load_state_dict(c['resampler'])
@@ -74,8 +76,14 @@ def main():
     policy.eval(); aggregator.eval(); resampler.eval()
     print(f"  step={c.get('step', '?')}  best_acc={c.get('best_acc', 0)*100:.1f}%")
 
-    print("Loading episodes ...")
-    episodes = load_so101_episodes(load_video=False)
+    # Pick the right episode loader from the ckpt's dataset tag.
+    ds_tag = c.get('dataset', 'so101')
+    oxe_id = c.get('oxe_dataset_id') or 'IPEC-COMMUNITY/bridge_orig_lerobot'
+    print(f"Loading episodes ({ds_tag}) ...")
+    if ds_tag == 'oxe':
+        episodes = load_lerobot_episodes(oxe_id, load_video=False)
+    else:
+        episodes = load_so101_episodes(load_video=False)
     loader = make_loader(args.cache_dir, episodes,
                          batch_size=1, num_workers=0, shuffle=True,
                          lru_size=2, augment=False)

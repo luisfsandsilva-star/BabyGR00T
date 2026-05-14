@@ -28,10 +28,11 @@ def main():
     ap.add_argument('--batch-size', type=int, default=32)
     ap.add_argument('--ckpt-path', type=str, default='so101_vae_revin.pt')
     ap.add_argument('--log-every', type=int, default=200)
-    ap.add_argument('--action-dim', type=int, default=6)
+    ap.add_argument('--action-dim', type=int, default=6,
+                    help="Bridge=7, SO-101=6. Must match the dataset.")
     ap.add_argument('--dataset', choices=['so101', 'oxe'], default='so101')
     ap.add_argument('--oxe-dataset-id', type=str,
-                    default='lerobot/svla_so101_pickplace')
+                    default='IPEC-COMMUNITY/bridge_orig_lerobot')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

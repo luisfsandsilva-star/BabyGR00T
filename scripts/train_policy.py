@@ -101,15 +101,18 @@ def main():
                     help="Apply the aux loss to every H cycle (preserves deep "
                          "supervision) or just the last (the v4 anti-pattern).")
     # Dataset selection (v5 — OXE migration).
-    # 'so101'  : the original 78-episode SO-101 set (pavelsimo + supplements).
-    # 'oxe'    : a single LeRobot dataset (default lerobot/svla_so101_pickplace,
-    #            the same SO-101 embodiment but ~50× larger). RevIN stats are
-    #            recomputed automatically per-instance, but the CQ-VAE should
-    #            be re-trained on the new action distribution.
+    # 'so101' : the original 78-episode SO-101 set (pavelsimo + supplements).
+    # 'oxe'   : a single LeRobot OXE dataset. Default = BridgeData V2
+    #           (IPEC-COMMUNITY/bridge_orig_lerobot, WidowX 7-DoF + 8-dim state).
+    #           The CQ-VAE must be retrained on the dataset's action distribution
+    #           (--action-dim must match: 7 for Bridge, 6 for SO-101).
     ap.add_argument('--dataset', choices=['so101', 'oxe'], default='so101')
     ap.add_argument('--oxe-dataset-id', type=str,
-                    default='lerobot/svla_so101_pickplace')
-    ap.add_argument('--oxe-camera', type=str, default='observation.images.front')
+                    default='IPEC-COMMUNITY/bridge_orig_lerobot')
+    ap.add_argument('--oxe-camera', type=str, default='observation.images.image_0')
+    ap.add_argument('--state-dim', type=int, default=None,
+                    help="State dim for the StateEncoder. If unset, inferred "
+                         "from the first episode (Bridge=8, SO-101=6).")
     # Resume
     ap.add_argument('--resume', type=str, default=None,
                     help="Path to ckpt. Restores weights + optimizer + step + best_acc.")
@@ -131,6 +134,19 @@ def main():
     print(f"  CQ-VAE: levels {SEQ_LENS_1D}  K={vae.vq1.K}  action_dim={action_dim}",
           flush=True)
 
+    # ── Load episodes early so we can infer state_dim from data ──
+    print(f"Loading episodes ({args.dataset}, cached features) ...", flush=True)
+    if args.dataset == 'oxe':
+        episodes = load_lerobot_episodes(args.oxe_dataset_id,
+                                          camera_key=args.oxe_camera,
+                                          load_video=False)
+    else:
+        episodes = load_so101_episodes(load_video=False)
+    inferred_state_dim = int(episodes[0][1].shape[-1])
+    state_dim = args.state_dim if args.state_dim is not None else inferred_state_dim
+    print(f"  state_dim = {state_dim}  (inferred {inferred_state_dim}; "
+          f"CLI override = {args.state_dim})", flush=True)
+
     # ── Vision pipeline + S-TRM policy ──
     aggregator = LayerAggregator(hidden_dim=VIS_HIDDEN_DIM, n_layers=25).to(device)
     resampler  = PerceiverResampler(input_dim=VIS_HIDDEN_DIM, dim=args.dim,
@@ -142,7 +158,7 @@ def main():
         rho1_target=args.rho1, rho2_target=args.rho2,
         rho_H_target=args.rho_H,
         alpha_init=args.alpha_init,
-        max_prefix=NUM_RESAMPLER_LATENTS + 16, state_dim=action_dim,
+        max_prefix=NUM_RESAMPLER_LATENTS + 16, state_dim=state_dim,
     ).to(device)
 
     n_pol = sum(p.numel() for p in policy.parameters()) / 1e6
@@ -166,14 +182,7 @@ def main():
           f"tau {args.tau_max}→{args.tau_min} over {args.tau_anneal_frac*100:.0f}%  |  {mc}",
           flush=True)
 
-    # ── Data ──
-    print(f"Loading episodes ({args.dataset}, cached features) ...", flush=True)
-    if args.dataset == 'oxe':
-        episodes = load_lerobot_episodes(args.oxe_dataset_id,
-                                          camera_key=args.oxe_camera,
-                                          load_video=False)
-    else:
-        episodes = load_so101_episodes(load_video=False)
+    # ── Data loader ──
     loader = make_loader(args.cache_dir, episodes,
                          batch_size=args.batch_size,
                          num_workers=args.num_workers,
@@ -259,7 +268,9 @@ def main():
             'L_inner': args.L_inner, 'H_outer': args.H_outer,
             'depth': args.depth, 'dim': args.dim,
             'rho1': args.rho1, 'rho2': args.rho2, 'rho_H': args.rho_H,
-            'action_dim': action_dim,
+            'action_dim': action_dim, 'state_dim': state_dim,
+            'dataset': args.dataset,
+            'oxe_dataset_id': args.oxe_dataset_id if args.dataset == 'oxe' else None,
         }, path)
 
     # ── Train ──

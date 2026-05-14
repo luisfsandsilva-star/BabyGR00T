@@ -7,9 +7,10 @@ Three named recipes ship with `scripts/train_policy.py`:
 - **v4** — v3 + MSE-decode auxiliary loss in *corrected* form (expectation
   mode, all H cycles, small β). The original v4 (argmax-STE, final-cycle
   only, β=0.1) actively regressed mse_pol — see "v4 lesson" below.
-- **v5** — v3 recipe trained on a much larger LeRobot dataset
-  (`lerobot/svla_so101_pickplace`, same SO-101 embodiment). Architecture
-  unchanged; the only thing that moves is the data scale.
+- **v5** — v3 recipe trained on **BridgeData V2** (OXE,
+  `IPEC-COMMUNITY/bridge_orig_lerobot`). **Different embodiment** (WidowX,
+  not SO-101): 7-DoF action, 8-dim state, 53k episodes. Architecture
+  unchanged; the data scale and embodiment both move.
 
 ---
 
@@ -85,43 +86,49 @@ discontinuity) + `all` (deep supervision preserved across H) + smaller β
 (don't dominate the codebook CE). Treat v4 as exploratory until validated
 side-by-side with v3.
 
-## v5 — OXE migration (lerobot/svla_so101_pickplace)
+## v5 — OXE migration (BridgeData V2, `IPEC-COMMUNITY/bridge_orig_lerobot`)
 
-The current bottleneck on the 78-episode SO-101 set is data, not
-architecture: param:target ratio is ~920:1 — pure memorization regime.
-Swapping to `lerobot/svla_so101_pickplace` (same SO-101 arm, same
-6-DoF action space, ~50× more episodes) drops the ratio to a healthy range
-without changing anything else.
+The current bottleneck on the 78-episode SO-101 set is data, not architecture
+— param:target ratio is ~920:1 (pure memorization regime). Migrating to
+**BridgeData V2** is also a **different embodiment** (WidowX, not SO-101),
+which is the real cross-validation we want. Action space is 7-DoF
+(6 + gripper), state is 8-dim; the CQ-VAE rebuilds against the new
+distribution. 53k episodes / 1.9M frames at 5 fps.
 
 The full migration is three steps. **Steps 1 and 2 take real time** (decoder
 on hours-scale, vision cache on hours-scale); only do step 3 once both have
-finished.
+finished. Cap with `--n-eps-cap N` for a fast overnight first pass —
+expect ~24 MB per chunk on disk, plan accordingly.
 
 ```bash
-# 1. Re-train the CQ-VAE on the OXE action distribution.
-#    The codebook is dataset-specific; using the SO-101-trained one
-#    leaves dead/unused codes for any new motion patterns.
+# 1. Re-train the CQ-VAE on Bridge's 7-DoF action distribution.
+#    The codebook is dataset-specific.
 python -m scripts.train_cqvae \
   --dataset oxe \
-  --oxe-dataset-id lerobot/svla_so101_pickplace \
+  --oxe-dataset-id IPEC-COMMUNITY/bridge_orig_lerobot \
   --steps 8000 --batch-size 32 \
+  --action-dim 7 \
   --ckpt-path oxe_vae_revin.pt
 
-# 2. Re-build the InternVL3 vision cache for OXE.
-#    `lerobot/svla_so101_pickplace` cameras are `observation.images.up` and
-#    `observation.images.side` (not `front`); pick one.
-#    `--n-vis-aug 0` for a fast first pass; bump it later for more diversity.
+# 2. Re-build the InternVL3 vision cache for Bridge.
+#    Cameras are observation.images.image_0/_1/_2/_3; image_0 is the primary.
+#    --n-vis-aug 0 for a fast first pass; bump it later for more diversity.
+#    --n-eps-cap to limit disk during an overnight first run.
 python -m scripts.cache_vision \
   --dataset oxe \
-  --oxe-dataset-id lerobot/svla_so101_pickplace \
-  --oxe-camera observation.images.up \
+  --oxe-dataset-id IPEC-COMMUNITY/bridge_orig_lerobot \
+  --oxe-camera observation.images.image_0 \
   --cache-dir oxe_vision_cache \
-  --n-vis-aug 0
+  --n-vis-aug 0 \
+  --n-eps-cap 200
 
 # 3. Train v5: identical hyperparameters to v3, only the data path differs.
+#    state-dim is inferred from the first episode (=8 for Bridge); override
+#    with --state-dim if needed.
 python -m scripts.train_policy \
   --dataset oxe \
-  --oxe-dataset-id lerobot/svla_so101_pickplace \
+  --oxe-dataset-id IPEC-COMMUNITY/bridge_orig_lerobot \
+  --oxe-camera observation.images.image_0 \
   --steps 50000 \
   --vae-ckpt oxe_vae_revin.pt \
   --cache-dir oxe_vision_cache \
@@ -153,6 +160,6 @@ red-cube-to-bowl phrasings; extend `babygroot_strm/augment.py` for new tasks.
 
 The 78-episode SO-101 set was too small to support a meaningful held-out
 test split — every probe number above is on training-set chunks (= upper
-bound on actual generalization). With `svla_so101_pickplace` you can finally
-hold out 5–10 % of episodes and report an honest test number; do this
-before drawing conclusions about v3 vs v4 vs anything new on OXE.
+bound on actual generalization). With Bridge V2 (~53k episodes) you can
+finally hold out 5–10 % of episodes and report an honest test number; do
+this before drawing conclusions about v3 vs v4 vs anything new on OXE.

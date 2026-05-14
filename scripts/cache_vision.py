@@ -32,7 +32,7 @@ Usage:
 
   # OXE with 3 visual variants per chunk:
   python -m scripts.cache_vision \
-      --dataset oxe --oxe-dataset-id lerobot/svla_so101_pickplace \
+      --dataset oxe --oxe-dataset-id IPEC-COMMUNITY/bridge_orig_lerobot \
       --oxe-camera observation.images.up \
       --cache-dir oxe_vision_cache \
       --n-vis-aug 3
@@ -63,13 +63,13 @@ def main():
     ap.add_argument('--dataset', choices=['so101', 'oxe'], default='so101',
                     help="`so101` = original 78-episode bundle. "
                          "`oxe` = a single LeRobot dataset (default "
-                         "lerobot/svla_so101_pickplace, the v5 target).")
+                         "IPEC-COMMUNITY/bridge_orig_lerobot, the v5 target).")
     ap.add_argument('--oxe-dataset-id', type=str,
-                    default='lerobot/svla_so101_pickplace')
-    ap.add_argument('--oxe-camera', type=str, default='observation.images.up',
+                    default='IPEC-COMMUNITY/bridge_orig_lerobot')
+    ap.add_argument('--oxe-camera', type=str, default='observation.images.image_0',
                     help="Camera video key inside the LeRobot dataset. "
-                         "lerobot/svla_so101_pickplace cameras are "
-                         "`observation.images.up` and `.side`.")
+                         "BridgeData V2 cameras are "
+                         "`observation.images.image_0/_1/_2/_3`.")
     ap.add_argument('--data-dir', default=None,
                     help="Local SO-101 dataset dir (only used for --dataset=so101).")
     # Augmentation

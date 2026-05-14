@@ -82,23 +82,49 @@ class SO101Streamer:
             print(f"Loading from local: {local_data_dir} ...")
             self.ds = load_dataset(local_data_dir, split='train')
             info_path = os.path.join(local_data_dir, 'meta/info.json')
+            tasks_path = os.path.join(local_data_dir, 'meta/tasks.jsonl')
+            tasks_path = tasks_path if os.path.exists(tasks_path) else None
         else:
             print(f"Loading {dataset_id} (streaming) ...")
             self.ds = load_dataset(dataset_id, split='train', streaming=True)
             info_path = hf_hub_download(dataset_id, 'meta/info.json', repo_type='dataset')
+            try:
+                tasks_path = hf_hub_download(dataset_id, 'meta/tasks.jsonl', repo_type='dataset')
+            except Exception:
+                tasks_path = None
         with open(info_path) as f:
             self.info = json.load(f)
         self.video_path_template = self.info['video_path']
         self.chunks_size = self.info['chunks_size']
         self.n_episodes = n_episodes
+        # Task lookup (LeRobot v2.0+ datasets ship meta/tasks.jsonl mapping
+        # task_index -> human-readable task). BridgeData V2 has 20k unique
+        # tasks; without this map we'd lose the language signal entirely.
+        self.tasks = {}
+        if tasks_path:
+            try:
+                with open(tasks_path) as f:
+                    for line in f:
+                        t = json.loads(line)
+                        self.tasks[t['task_index']] = t['task']
+                print(f"  {len(self.tasks)} unique task descriptions")
+            except Exception:
+                pass
         print(f"  {self.info['total_episodes']} episodes, "
               f"{self.info['total_frames']} frames, {self.info['fps']} FPS")
 
     def _download_video(self, episode_idx, camera=None):
         camera = camera or self.camera_key
         chunk_idx = episode_idx // self.chunks_size
+        # LeRobot v2.0 templates use {episode_chunk}/{episode_index}
+        # (e.g. BridgeData V2 IPEC-COMMUNITY/bridge_orig_lerobot); some
+        # v2.x variants use {chunk_index}/{file_index}. Passing both pairs
+        # covers both layouts since str.format ignores unused keys.
         rel = self.video_path_template.format(
-            video_key=camera, chunk_index=chunk_idx, file_index=episode_idx)
+            video_key=camera,
+            chunk_index=chunk_idx, episode_chunk=chunk_idx,
+            file_index=episode_idx, episode_index=episode_idx,
+        )
         local = os.path.join(self.local_data_dir, rel)
         if os.path.exists(local):
             return local
@@ -136,26 +162,31 @@ class SO101Streamer:
     def stream_episodes(self):
         it = iter(self.ds)
         current_ep = -1; ep_actions, ep_states = [], []
+        ep_task_idx = 0
         yielded = 0
         for sample in it:
             ep = sample['episode_index']
             if ep != current_ep:
                 if current_ep >= 0 and len(ep_actions) >= self.chunk_len:
-                    yield self._package(current_ep, ep_actions, ep_states)
+                    yield self._package(current_ep, ep_actions, ep_states, ep_task_idx)
                     yielded += 1
                     if yielded >= self.n_episodes:
                         return
                 current_ep = ep; ep_actions, ep_states = [], []
+                ep_task_idx = sample.get('task_index', 0)
             ep_actions.append(sample['action'])
             ep_states.append(sample['observation.state'])
         if len(ep_actions) >= self.chunk_len and yielded < self.n_episodes:
-            yield self._package(current_ep, ep_actions, ep_states)
+            yield self._package(current_ep, ep_actions, ep_states, ep_task_idx)
 
-    def _package(self, ep_idx, actions, states):
+    def _package(self, ep_idx, actions, states, task_idx=0):
         actions = torch.tensor(actions, dtype=torch.float32)
         states  = torch.tensor(states,  dtype=torch.float32)
+        # Respect the actual action dim from the dataset (Bridge=7, SO-101=6),
+        # don't reshape against a hardcoded constant.
+        A = actions.shape[-1]
         n_ch = max(1, len(actions) // self.chunk_len)
-        action_chunks = actions[:n_ch * self.chunk_len].view(n_ch, self.chunk_len, ACTION_DIM)
+        action_chunks = actions[:n_ch * self.chunk_len].view(n_ch, self.chunk_len, A)
         chunk_states  = states[::self.chunk_len][:n_ch]
         per_chunk_frames = None
         if self.load_video:
@@ -168,7 +199,8 @@ class SO101Streamer:
         if per_chunk_frames is None:
             empty = Image.new('RGB', (IMG_SIZE, IMG_SIZE))
             per_chunk_frames = [[empty] * NUM_FRAMES for _ in range(n_ch)]
-        return action_chunks, chunk_states, per_chunk_frames, "pick and place"
+        task_str = self.tasks.get(task_idx, "manipulate the object")
+        return action_chunks, chunk_states, per_chunk_frames, task_str
 
 
 def _has_real_video(ep_idx, source, data_dir, supplement_dir):
@@ -241,9 +273,9 @@ def load_so101_episodes(load_video=False, only_real_video=True,
     return eps
 
 
-def load_lerobot_episodes(dataset_id="lerobot/svla_so101_pickplace",
+def load_lerobot_episodes(dataset_id="IPEC-COMMUNITY/bridge_orig_lerobot",
                           load_video=False,
-                          camera_key="observation.images.front",
+                          camera_key="observation.images.image_0",
                           local_data_dir=None,
                           n_episodes=None,
                           prompt=None):
@@ -252,23 +284,23 @@ def load_lerobot_episodes(dataset_id="lerobot/svla_so101_pickplace",
     Returns the same tuple format as `load_so101_episodes`:
         list[ (action_chunks, chunk_states, per_chunk_frames, prompt) ].
 
-    Default `dataset_id` is `lerobot/svla_so101_pickplace` — the same SO-101
-    embodiment as our original 78-episode set, but ~50× larger (the v5 OXE
-    target). Pass any LeRobot-format dataset_id for a different one (e.g.
-    `lerobot/bridge_data_v2` for the BridgeData V2 WidowX set).
+    Default is **BridgeData V2** (`IPEC-COMMUNITY/bridge_orig_lerobot`) — the
+    chosen OXE migration target for v5. WidowX 6-DoF + 1 gripper (action_dim=7,
+    state_dim=8), 53k episodes / 1.9M frames at 5 fps, four cameras
+    (`observation.images.image_0/1/2/3`). Pass any LeRobot-format
+    `dataset_id` to swap (e.g. `IPEC-COMMUNITY/fractal20220817_data_lerobot`
+    for RT-1 Google Robot).
 
     Args:
-        dataset_id     : HuggingFace dataset id (LeRobot format).
+        dataset_id     : HuggingFace dataset id (LeRobot v2.0 format).
         load_video     : if True, decode per-chunk frames; else placeholders.
         camera_key     : video key inside the dataset
-                         (e.g. `observation.images.front`,
-                          `observation.images.top`,
-                          `observation.images.wrist`).
-        local_data_dir : optional local cache path. If unset, defaults to
+                         (BridgeV2: `observation.images.image_0` is primary).
+        local_data_dir : optional local cache path. If unset, defaults under
                          `~/Desktop/BabyGR00TNew/data/<repo-name>`.
         n_episodes     : cap (default = all episodes from `meta/info.json`).
-        prompt         : task prompt to attach to every episode.
-                         If None, uses a generic LeRobot fallback.
+        prompt         : task prompt. If None, derives one from each episode's
+                         own `task` field (LeRobot v2.0+ datasets carry these).
     """
     if local_data_dir is None:
         local_data_dir = os.path.expanduser(

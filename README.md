@@ -21,7 +21,7 @@
 > ⚠️ **Status: not finalized — testing under way.**
 > The pipeline (data → CQ-VAE → vision cache → policy → eval) runs end-to-end
 > and all four stages have been smoke-tested on real data, including a tiny
-> OXE subset (`lerobot/svla_so101_pickplace`, 1 episode, 18 chunks ×
+> OXE subset (BridgeData V2 / `IPEC-COMMUNITY/bridge_orig_lerobot`, 1 episode ×
 > 2 augmented variants, full InternVL3 + InternVL3 cache). Full-scale
 > training runs on the OXE-scale dataset are **not yet validated**.
 > Architecture, hyperparameter recipes, and APIs may still change.
@@ -48,8 +48,10 @@ supervision. That model is what this repo currently implements.
 
 The current model has been tested on the SO-101 78-episode dataset
 (`pavelsimo/SO-101-pick-and-place` + supplements). It is now being
-ported to the OXE-equivalent `lerobot/svla_so101_pickplace` to break the
-data-scarcity regime; that migration is underway.
+ported to **BridgeData V2** on Open X-Embodiment
+(`IPEC-COMMUNITY/bridge_orig_lerobot`) — different embodiment (WidowX,
+not SO-101), 53k episodes / 1.9M frames — to break the data-scarcity
+regime; that migration is underway.
 
 ---
 
@@ -163,10 +165,10 @@ training loop only pays the disk-read cost:
   (expectation mode, all H cycles). The original v4 run with
   `argmax-STE + final-cycle-only + β=0.1` was an anti-pattern (mse_pol
   regressed); the corrected recipe uses smoother formulations.
-- **v5** — v3 architecture trained on `lerobot/svla_so101_pickplace`
-  (same SO-101 embodiment, ~50 episodes, ~12K frames). Migration code
-  exists and the cache pipeline has been validated on a 1-episode subset;
-  full-scale training has not run yet.
+- **v5** — v3 architecture trained on **BridgeData V2** (OXE,
+  `IPEC-COMMUNITY/bridge_orig_lerobot`), different embodiment (WidowX
+  7-DoF + 1-gripper, 8-dim state, 53k episodes). Migration code is in
+  the repo; full-scale training has not run yet.
 
 ---
 
@@ -178,7 +180,7 @@ support in the LeRobot dataset ecosystem. Datasets currently used or
 planned:
 
 - `pavelsimo/SO-101-pick-and-place` — original 78-ep set (action_dim=6)
-- `lerobot/svla_so101_pickplace` — OXE-style SO-101 (50 ep, in progress)
+- `IPEC-COMMUNITY/bridge_orig_lerobot` — BridgeData V2 on OXE (WidowX, 53k ep) ← current v5 target
 - `lerobot/bridge_data_v2` — fallback if SO-101 OXE is too small
   (60K trajectories, WidowX 6-DoF + gripper)
 
@@ -285,7 +287,7 @@ print(f'params: {sum(p.numel() for p in m.parameters())/1e6:.2f}M')
 | Milestone | Deliverable | Status |
 |---|---|---|
 | **v0.5 corrected** (this repo) | S-TRM v3 pipeline end-to-end on SO-101 78-ep + tiny OXE smoke test | **Code complete, training runs underway.** |
-| v0.5 OXE | Full v3 retrain on `lerobot/svla_so101_pickplace`, with held-out test split | Not started — code path validated only. |
+| v0.5 OXE | Full v3 retrain on BridgeData V2 (OXE), with held-out test split | Not started — code path validated only. |
 | v1.0 | Hardware deployment (SO-101), real-task evaluation | Future. |
 | v1.5 | Cross-embodiment evaluation (BridgeData V2 / Fractal20220817) | Future. |
 | v2.0 | World-model augmentation, RL fine-tuning | Future. |
