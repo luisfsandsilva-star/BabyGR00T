@@ -48,6 +48,7 @@ python -m scripts.train_cqvae \
     --oxe-dataset-id "$DATASET_ID" \
     --action-dim 7 \
     --steps 8000 --batch-size 32 \
+    --n-eps-cap "$N_EPS_CAP" \
     --ckpt-path "$VAE_CKPT"
 echo "=== STAGE 2 DONE: $(date) ==="
 echo

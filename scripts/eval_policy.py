@@ -76,14 +76,25 @@ def main():
     policy.eval(); aggregator.eval(); resampler.eval()
     print(f"  step={c.get('step', '?')}  best_acc={c.get('best_acc', 0)*100:.1f}%")
 
-    # Pick the right episode loader from the ckpt's dataset tag.
+    # Pick the right episode loader from the ckpt's dataset tag. Cap to the
+    # number of episodes actually present in the vision cache (same reason as
+    # train_policy: avoid indexing eps whose cache file doesn't exist).
+    import json
     ds_tag = c.get('dataset', 'so101')
     oxe_id = c.get('oxe_dataset_id') or 'IPEC-COMMUNITY/bridge_orig_lerobot'
-    print(f"Loading episodes ({ds_tag}) ...")
+    cache_meta_path = os.path.join(args.cache_dir, 'meta.json')
+    cache_n_episodes = None
+    if os.path.exists(cache_meta_path):
+        with open(cache_meta_path) as f:
+            cache_n_episodes = int(json.load(f).get('n_episodes') or 0) or None
+    print(f"Loading episodes ({ds_tag}, cap={cache_n_episodes}) ...")
     if ds_tag == 'oxe':
-        episodes = load_lerobot_episodes(oxe_id, load_video=False)
+        episodes = load_lerobot_episodes(oxe_id, load_video=False,
+                                          n_episodes=cache_n_episodes)
     else:
         episodes = load_so101_episodes(load_video=False)
+        if cache_n_episodes:
+            episodes = episodes[:cache_n_episodes]
     loader = make_loader(args.cache_dir, episodes,
                          batch_size=1, num_workers=0, shuffle=True,
                          lru_size=2, augment=False)

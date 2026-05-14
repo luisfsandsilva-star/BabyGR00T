@@ -135,13 +135,30 @@ def main():
           flush=True)
 
     # ── Load episodes early so we can infer state_dim from data ──
+    # IMPORTANT: cap to the number of episodes that actually have vision-cache
+    # files. The cache's meta.json carries that number (set when cache_vision
+    # was run). Without this cap, ChunkDataset indexes all 53k Bridge eps and
+    # crashes the first time DataLoader samples one that wasn't cached.
+    import json
+    cache_meta_path = os.path.join(args.cache_dir, 'meta.json')
+    cache_n_episodes = None
+    if os.path.exists(cache_meta_path):
+        with open(cache_meta_path) as f:
+            cache_n_episodes = int(json.load(f).get('n_episodes') or 0)
+        if cache_n_episodes > 0:
+            print(f"  cache contains {cache_n_episodes} episodes — capping "
+                  f"dataset load to match.", flush=True)
+
     print(f"Loading episodes ({args.dataset}, cached features) ...", flush=True)
     if args.dataset == 'oxe':
         episodes = load_lerobot_episodes(args.oxe_dataset_id,
                                           camera_key=args.oxe_camera,
-                                          load_video=False)
+                                          load_video=False,
+                                          n_episodes=cache_n_episodes)
     else:
         episodes = load_so101_episodes(load_video=False)
+        if cache_n_episodes:
+            episodes = episodes[:cache_n_episodes]
     inferred_state_dim = int(episodes[0][1].shape[-1])
     state_dim = args.state_dim if args.state_dim is not None else inferred_state_dim
     print(f"  state_dim = {state_dim}  (inferred {inferred_state_dim}; "

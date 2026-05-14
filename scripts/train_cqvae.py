@@ -33,16 +33,23 @@ def main():
     ap.add_argument('--dataset', choices=['so101', 'oxe'], default='so101')
     ap.add_argument('--oxe-dataset-id', type=str,
                     default='IPEC-COMMUNITY/bridge_orig_lerobot')
+    ap.add_argument('--n-eps-cap', type=int, default=None,
+                    help="Cap dataset episodes. Set to match the planned "
+                         "policy training set; otherwise we stream all 53k "
+                         "Bridge eps just to fit the codebook.")
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.manual_seed(42)
 
-    print(f"Loading episodes ({args.dataset}, no video) ...")
+    print(f"Loading episodes ({args.dataset}, no video, cap={args.n_eps_cap}) ...")
     if args.dataset == 'oxe':
-        eps = load_lerobot_episodes(args.oxe_dataset_id, load_video=False)
+        eps = load_lerobot_episodes(args.oxe_dataset_id, load_video=False,
+                                     n_episodes=args.n_eps_cap)
     else:
         eps = load_so101_episodes(load_video=False)
+        if args.n_eps_cap:
+            eps = eps[:args.n_eps_cap]
     actions = torch.cat([ep[0] for ep in eps], dim=0)               # (N, T, A)
     print(f"  {len(actions)} chunks, action_dim={actions.shape[-1]}")
 
