@@ -9,12 +9,14 @@ dist/
 
 # Caches & checkpoints (large)
 vision_cache/
+oxe_vision_cache/
 *.pt
 *.bin
 data/
 
-# Logs
+# Logs / runtime
 *.log
+*.pid
 hparam_log.jsonl
 
 # OS / editor
