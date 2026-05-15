@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Train the 3-level CQ-VAE on SO-101 action chunks.
+"""Train the single-bottleneck VQ-VAE on action chunks.
 
-The CQ-VAE is the policy's target codebook — train it once, then freeze it
-during S-TRM training. RevIN normalizes per-instance before the encoder and
-the decoder works in the same normalized space.
+Direct comparison baseline for the 3-level CQ-VAE — identical encoder, a
+single codebook at the bottleneck (4 tokens × 256 ch × K=128), no
+decoder skip connections. See babygroot_strm/vqvae.py for the design.
 
-Usage:
-  python -m scripts.train_cqvae --steps 5000 --batch-size 32
+Usage (Bridge V2, full action stream):
+  python -m scripts.train_vqvae \\
+      --dataset oxe --action-dim 7 \\
+      --steps 8000 --batch-size 32 \\
+      --ckpt-path oxe_vqvae.pt
+
+Usage (SO-101, original 78-ep set):
+  python -m scripts.train_vqvae --steps 5000 --batch-size 32
 """
-import os, sys, time, math, argparse
+import os, sys, time, argparse
 
 THIS = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(THIS))
@@ -17,7 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 
-from babygroot_strm import (RevIN, ActionRQUNet1d, VQ1d_EMA,
+from babygroot_strm import (RevIN, ActionVQVAE1d, VQ1d_EMA,
                             load_so101_episodes, load_lerobot_episodes)
 
 
@@ -26,7 +32,7 @@ def main():
     ap.add_argument('--steps', type=int, default=5000)
     ap.add_argument('--lr', type=float, default=1e-4)
     ap.add_argument('--batch-size', type=int, default=32)
-    ap.add_argument('--ckpt-path', type=str, default='so101_vae_revin.pt')
+    ap.add_argument('--ckpt-path', type=str, default='vqvae.pt')
     ap.add_argument('--log-every', type=int, default=200)
     ap.add_argument('--action-dim', type=int, default=6,
                     help="Bridge=7, SO-101=6. Must match the dataset.")
@@ -34,9 +40,7 @@ def main():
     ap.add_argument('--oxe-dataset-id', type=str,
                     default='IPEC-COMMUNITY/bridge_orig_lerobot')
     ap.add_argument('--n-eps-cap', type=int, default=None,
-                    help="Cap dataset episodes. Set to match the planned "
-                         "policy training set; otherwise we stream all 53k "
-                         "Bridge eps just to fit the codebook.")
+                    help="Cap dataset episodes. Default = all available.")
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -53,17 +57,17 @@ def main():
     actions = torch.cat([ep[0] for ep in eps], dim=0)               # (N, T, A)
     print(f"  {len(actions)} chunks, action_dim={actions.shape[-1]}")
 
-    vae   = ActionRQUNet1d(action_dim=args.action_dim, vq_cls=VQ1d_EMA).to(device)
+    vae   = ActionVQVAE1d(action_dim=args.action_dim, vq_cls=VQ1d_EMA).to(device)
     revin = RevIN(args.action_dim).to(device)
     n_p = sum(p.numel() for p in vae.parameters()) / 1e6
-    print(f"  CQ-VAE params: {n_p:.2f}M")
+    print(f"  VQ-VAE params: {n_p:.2f}M  "
+          f"bottleneck: {vae.bottleneck_T} tokens × {vae.vq.D} ch, K={vae.vq.K}")
 
     opt = torch.optim.AdamW(list(vae.parameters()) + list(revin.parameters()),
                             lr=args.lr, weight_decay=1e-4)
     loader = DataLoader(TensorDataset(actions), batch_size=args.batch_size,
                         shuffle=True, drop_last=True)
-    n_per_epoch = len(loader)
-    print(f"  {n_per_epoch} batches/epoch")
+    print(f"  {len(loader)} batches/epoch")
 
     vae.train(); revin.train()
     t0 = time.perf_counter(); step = 0
@@ -72,8 +76,8 @@ def main():
         for (action,) in loader:
             if step >= args.steps:
                 break
-            action = action.to(device, non_blocking=True)           # (B, T, A)
-            x = revin(action, 'norm').transpose(1, 2)               # (B, A, T)
+            action = action.to(device, non_blocking=True)
+            x = revin(action, 'norm').transpose(1, 2)
             embs, vql, _ = vae.encode(x)
             recon = vae.decode(embs)
             recon_loss = F.mse_loss(recon, x)
@@ -88,10 +92,10 @@ def main():
                       f"vq={win_vq/win_steps:.4f}  [{elapsed:.0f}s]", flush=True)
                 win_recon, win_vq, win_steps = 0.0, 0.0, 0
 
-    torch.save({'kind': 'cqvae',
+    torch.save({'kind': 'vqvae',
                 'vae': vae.state_dict(), 'revin': revin.state_dict(),
                 'action_dim': args.action_dim,
-                'seq_lens': vae.seq_lens, 'k': vae.vq1.K},
+                'seq_lens': vae.seq_lens, 'k': vae.vq.K},
                args.ckpt_path)
     print(f"\nSaved {args.ckpt_path}")
 

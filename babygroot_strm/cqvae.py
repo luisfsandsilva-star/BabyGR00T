@@ -198,6 +198,21 @@ class ActionRQUNet1d(nn.Module):
         self.d1     = UpBlock1d(d * 2, d,     d)
         self.out    = nn.Conv1d(d, action_dim, 1)
 
+    # ── Uniform API for the policy + eval (mirrored on ActionVQVAE1d) ──
+    @property
+    def vqs(self):
+        """Coarsest-first list of VQ modules (matches encode/decode order)."""
+        return [self.vq3, self.vq2, self.vq1]
+
+    @property
+    def seq_lens(self):
+        """Per-level token counts, coarsest-first. (4, 8, 16) here."""
+        return list(SEQ_LENS_1D)
+
+    @property
+    def kind(self):
+        return 'cqvae'
+
     def encode(self, x):
         """Returns (embs[L0,L1,L2], commit_loss, indices[L0,L1,L2])."""
         r = self.stem(x); vql = 0.0

@@ -114,7 +114,11 @@ without the recurrence diverging):
 - **Softmax-1 attention sink** so heads can abstain cleanly.
 
 Action codebook: a **3-level convolutional CQ-VAE** (4 / 8 / 16 tokens,
-K=128 each), with RevIN normalization and EMA codebook updates.
+K=128 each), with RevIN normalization and EMA codebook updates. A
+**single-level convolutional VQ-VAE** is included as a direct comparison
+baseline — same encoder, single codebook at the bottleneck (4 × 256 ×
+K=128), no decoder skip connections (`babygroot_strm/vqvae.py`). The policy
+auto-dispatches on the VAE kind tag stored in the checkpoint.
 
 Vision: cached InternVL3-1B features (8-bit, frozen) + a learned
 LayerAggregator over the 25 LLM-layer hidden states + a Flamingo-style
@@ -131,19 +135,47 @@ Four stages, each independent and resumable. See `docs/RECIPES.md` for
 full v3 / v4 / v5 commands.
 
 ```bash
-# 1. Train the 3-level CQ-VAE on action chunks
-python -m scripts.train_cqvae --steps 5000
+# 1. Train an action codebook on action chunks.
+#    Two options — same encoder, differ only in the codebook structure:
+python -m scripts.train_cqvae --steps 5000   # 3-level CQ-VAE  (default)
+python -m scripts.train_vqvae --steps 5000   # single-level VQ-VAE baseline
 
 # 2. Cache InternVL3 features for every chunk (one-time per dataset).
 #    Optional: --n-vis-aug N for cached visual augmentation.
 python -m scripts.cache_vision --cache-dir vision_cache
 
-# 3. Train the policy (default = v3 recipe)
-python -m scripts.train_policy --steps 25000
+# 3. Train the policy. Automatically dispatches on the VAE ckpt's `kind`
+#    field, so the same script works for CQ-VAE or VQ-VAE checkpoints.
+python -m scripts.train_policy --steps 25000 --vae-ckpt so101_vae_revin.pt
 
 # 4. H-scaling eval — top-k accuracy + action-space MSE
 python -m scripts.eval_policy so101_strm.pt
 ```
+
+### One-shot overnight pipelines (Bridge V2 / OXE)
+
+Two end-to-end scripts for unattended runs on another machine. They cap
+the vision cache at 350 episodes (~14 GB) to fit a 20 GB disk budget and
+chain everything under `set -e`:
+
+```bash
+./overnight.sh        > overnight.log 2>&1 &     # cache + CQ-VAE + policy
+./overnight_vqvae.sh  > overnight.log 2>&1 &     # reuses the cache;  VQ-VAE + policy
+```
+
+Outputs from a full run:
+
+| File | Contents |
+|---|---|
+| `oxe_vision_cache/` | int8 InternVL3 features for the chosen episodes |
+| `oxe_vae_revin.pt` | 3-level CQ-VAE codebook |
+| `oxe_vqvae.pt` | single-level VQ-VAE codebook |
+| `oxe_strm_v5.pt` | S-TRM policy trained against the CQ-VAE |
+| `oxe_strm_v5_vqvae.pt` | S-TRM policy trained against the VQ-VAE |
+
+The two policy checkpoints share the same v5 hyperparameters, training
+steps, and visual cache — so the only variable between them is the
+action codebook structure.
 
 ### Cache-time augmentation
 

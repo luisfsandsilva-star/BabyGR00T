@@ -1,6 +1,6 @@
 # Recipes
 
-Three named recipes ship with `scripts/train_policy.py`:
+Named recipes ship with `scripts/train_policy.py`:
 
 - **v3** — Pareto-best (current default). Plain CE, depth=2/dim=768, outer
   Parcae 1/H, mask curriculum, stochastic-H training.
@@ -11,6 +11,12 @@ Three named recipes ship with `scripts/train_policy.py`:
   `IPEC-COMMUNITY/bridge_orig_lerobot`). **Different embodiment** (WidowX,
   not SO-101): 7-DoF action, 8-dim state, 53k episodes. Architecture
   unchanged; the data scale and embodiment both move.
+- **v5-vqvae** — v5 architecture and recipe, with the action codebook
+  swapped from the 3-level CQ-VAE to the single-level VQ-VAE
+  (`ActionVQVAE1d`). The encoder is identical to the CQ-VAE; only the
+  codebook structure changes. The clean comparison answer to "does the
+  CQ-VAE's hierarchical residual + skip-connection structure earn its
+  cost?"
 
 ---
 
@@ -137,9 +143,51 @@ python -m scripts.train_policy \
 
 `load_lerobot_episodes()` works for any LeRobot-format dataset — pass
 `--oxe-dataset-id <other-id>` to swap in a different OXE subset (e.g.
-`lerobot/bridge_data_v2` for WidowX BridgeData V2). For datasets with a
-different action dimensionality, also pass `--action-dim <d>` to
-`train_cqvae.py`.
+`IPEC-COMMUNITY/fractal20220817_data_lerobot` for RT-1 Google Robot). For
+datasets with a different action dimensionality, also pass `--action-dim <d>`
+to `train_cqvae.py` (or `train_vqvae.py`).
+
+## v5-vqvae — direct CQ-VAE vs VQ-VAE comparison
+
+This is the bit-for-bit-fairest version of "does the CQ-VAE's hierarchical
+structure earn its cost?". Same encoder, same vision cache, same policy
+hyperparameters, same training steps — only the codebook structure
+changes:
+
+| | CQ-VAE (v5) | VQ-VAE (v5-vqvae) |
+|---|---|---|
+| Encoder | `stem → f1 → proj12 → f2 → proj23 → f3` | **identical** |
+| Codebooks | 3 (at T, T/2, T/4 resolutions) | 1 (at the T/4 bottleneck) |
+| Codebook shape | 4×256, 8×128, 16×64 (K=128 each) | 4×256, K=128 |
+| Residual passing across levels | yes (RQ-style) | no (single level) |
+| Decoder | U-Net with encoder skip connections | pure upsample, no skips |
+| Info capacity per chunk | 28 tokens × 7 bits = 196 bits | 4 tokens × 7 bits = 28 bits |
+| Parameter count (action_dim=7) | ~2674 K | ~2588 K |
+| Policy `seq_lens` | `(4, 8, 16)` | `(4,)` |
+
+The 86 K-param difference is the second and third codebooks plus the
+skip-conv U-Net decoder. Everything else is shared.
+
+Run after the CQ-VAE pipeline (`overnight.sh`) has completed so the
+vision cache and the comparison reference are already on disk:
+
+```bash
+./overnight_vqvae.sh > overnight_vqvae.log 2>&1 &
+```
+
+Outputs:
+- `oxe_vqvae.pt` — single-level VQ-VAE codebook (~10 MB)
+- `oxe_strm_v5_vqvae.pt` — S-TRM policy trained on top (~640 MB)
+
+Eval both side-by-side:
+
+```bash
+python -m scripts.eval_policy oxe_strm_v5.pt       --vae-ckpt oxe_vae_revin.pt
+python -m scripts.eval_policy oxe_strm_v5_vqvae.pt --vae-ckpt oxe_vqvae.pt
+```
+
+Both `train_policy.py` and `eval_policy.py` auto-detect the VAE kind
+from the checkpoint's `kind` field — no flag needed at the policy step.
 
 ### Cache-time augmentation
 

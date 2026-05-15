@@ -1,6 +1,7 @@
 """babygroot_strm — S-TRM v3 over a 3-level CQ-VAE for SO-101 manipulation."""
 from .cqvae import (RevIN, ActionRQUNet1d, VQ1d_EMA, cosine_snce_tau,
                     SEQ_LENS_1D)
+from .vqvae import ActionVQVAE1d
 from .vision import (LayerAggregator, PerceiverResampler, ScaleNorm,
                      InternVL3Vision, NUM_RESAMPLER_LATENTS,
                      VIS_HIDDEN_DIM, NUM_FRAMES, TILE_SIZE)
@@ -14,7 +15,8 @@ from .augment import (visual_augment_chunk, sample_paraphrases,
                       build_paraphrase_pool, PARAPHRASE_BANK)
 
 __all__ = [
-    "RevIN", "ActionRQUNet1d", "VQ1d_EMA", "cosine_snce_tau", "SEQ_LENS_1D",
+    "RevIN", "ActionRQUNet1d", "ActionVQVAE1d",
+    "VQ1d_EMA", "cosine_snce_tau", "SEQ_LENS_1D",
     "LayerAggregator", "PerceiverResampler", "ScaleNorm", "InternVL3Vision",
     "NUM_RESAMPLER_LATENTS", "VIS_HIDDEN_DIM", "NUM_FRAMES", "TILE_SIZE",
     "STRMPolicy", "MuSGD_LARS",

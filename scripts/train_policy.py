@@ -28,7 +28,7 @@ import torch
 
 import torch.nn.functional as F
 
-from babygroot_strm import (RevIN, ActionRQUNet1d, VQ1d_EMA,
+from babygroot_strm import (RevIN, ActionRQUNet1d, ActionVQVAE1d, VQ1d_EMA,
                             LayerAggregator, PerceiverResampler,
                             STRMPolicy, MuSGD_LARS,
                             load_so101_episodes, load_lerobot_episodes,
@@ -121,17 +121,23 @@ def main():
     torch.manual_seed(42); np.random.seed(42); random.seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # ── Frozen CQ-VAE + RevIN ──
-    print(f"Loading frozen CQ-VAE from {args.vae_ckpt} ...", flush=True)
+    # ── Frozen action codebook + RevIN (CQ-VAE or VQ-VAE) ──
+    print(f"Loading frozen VAE from {args.vae_ckpt} ...", flush=True)
     ck = torch.load(args.vae_ckpt, map_location=device, weights_only=False)
     action_dim = ck.get('action_dim', 6)
-    vae   = ActionRQUNet1d(action_dim=action_dim, vq_cls=VQ1d_EMA).to(device)
+    vae_kind   = ck.get('kind', 'cqvae')
+    if vae_kind == 'vqvae':
+        vae = ActionVQVAE1d(action_dim=action_dim, vq_cls=VQ1d_EMA).to(device)
+    else:
+        vae = ActionRQUNet1d(action_dim=action_dim, vq_cls=VQ1d_EMA).to(device)
     revin = RevIN(action_dim).to(device)
     vae.load_state_dict(ck['vae']); revin.load_state_dict(ck['revin']); vae.eval()
     for p in vae.parameters():
         p.requires_grad = False
     revin.eval()
-    print(f"  CQ-VAE: levels {SEQ_LENS_1D}  K={vae.vq1.K}  action_dim={action_dim}",
+    seq_lens = tuple(vae.seq_lens)
+    K = vae.vqs[0].K
+    print(f"  VAE: kind={vae_kind}  levels={seq_lens}  K={K}  action_dim={action_dim}",
           flush=True)
 
     # ── Load episodes early so we can infer state_dim from data ──
@@ -169,7 +175,7 @@ def main():
     resampler  = PerceiverResampler(input_dim=VIS_HIDDEN_DIM, dim=args.dim,
                                     num_latents=NUM_RESAMPLER_LATENTS).to(device)
     policy = STRMPolicy(
-        seq_lens=tuple(SEQ_LENS_1D), k_codebook=vae.vq1.K,
+        seq_lens=seq_lens, k_codebook=K,
         dim=args.dim, heads=8, depth=args.depth,
         L_inner=args.L_inner, H_outer=args.H_outer,
         rho1_target=args.rho1, rho2_target=args.rho2,
@@ -253,8 +259,8 @@ def main():
     def run_probe(n_probe):
         """All-masked accuracy on n_probe random samples (final-cycle preds)."""
         policy.eval(); aggregator.eval(); resampler.eval()
-        correct_per_lvl = [0] * len(SEQ_LENS_1D)
-        total_per_lvl   = [0] * len(SEQ_LENS_1D)
+        correct_per_lvl = [0] * len(seq_lens)
+        total_per_lvl   = [0] * len(seq_lens)
         idxs = random.sample(range(len(loader.dataset)),
                              min(n_probe, len(loader.dataset)))
         with torch.no_grad():
@@ -267,10 +273,10 @@ def main():
                 indices, _ = encode_codes(action, tau=0.1)
                 all_logits = policy(None, vis, state, mask_list=None)
                 final = all_logits[-1]
-                for l in range(len(SEQ_LENS_1D)):
+                for l in range(len(seq_lens)):
                     preds = final[l].argmax(-1)
                     correct_per_lvl[l] += (preds == indices[l]).sum().item()
-                    total_per_lvl[l]   += SEQ_LENS_1D[l]
+                    total_per_lvl[l]   += seq_lens[l]
         policy.train(); aggregator.train(); resampler.train()
         return [c / max(t, 1) for c, t in zip(correct_per_lvl, total_per_lvl)]
 
@@ -281,7 +287,7 @@ def main():
             'policy':     policy.state_dict(),
             'opt':        opt.state_dict(),
             'step': step, 'best_acc': best_acc,
-            'seq_lens': SEQ_LENS_1D, 'k': vae.vq1.K,
+            'seq_lens': list(seq_lens), 'k': K, 'vae_kind': vae_kind,
             'L_inner': args.L_inner, 'H_outer': args.H_outer,
             'depth': args.depth, 'dim': args.dim,
             'rho1': args.rho1, 'rho2': args.rho2, 'rho_H': args.rho_H,
@@ -293,7 +299,7 @@ def main():
     # ── Train ──
     print(f"\nTraining {args.steps} steps  ({loss_kind}) ...", flush=True)
     policy.train(); aggregator.train(); resampler.train()
-    n_lvls = len(SEQ_LENS_1D)
+    n_lvls = len(seq_lens)
     win_correct = [0] * n_lvls; win_total = [0] * n_lvls
     win_loss = 0.0; win_mse_decode = 0.0; win_steps = 0
     best_acc = resume_best_acc
@@ -341,7 +347,7 @@ def main():
         # The CQ-VAE decoder is frozen — its parameters don't update, but
         # gradients pass through to the policy's logits.
         if args.mse_decode_weight > 0:
-            vqs = [vae.vq3, vae.vq2, vae.vq1]    # coarsest first, matches policy
+            vqs = vae.vqs    # coarsest-first; CQ-VAE→3 entries, VQ-VAE→1 entry
             a_target = revin(action, 'norm').transpose(1, 2)
             cycles = (all_logits if args.mse_decode_cycles == 'all'
                       else [all_logits[-1]])

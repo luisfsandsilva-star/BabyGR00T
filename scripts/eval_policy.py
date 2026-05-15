@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(THIS))
 
 import torch
 
-from babygroot_strm import (RevIN, ActionRQUNet1d, VQ1d_EMA,
+from babygroot_strm import (RevIN, ActionRQUNet1d, ActionVQVAE1d, VQ1d_EMA,
                             LayerAggregator, PerceiverResampler,
                             STRMPolicy,
                             load_so101_episodes, load_lerobot_episodes,
@@ -53,18 +53,25 @@ def main():
     print(f"  trained: depth={trained_depth} dim={trained_dim} L={trained_L} "
           f"H={trained_H} ρ1={rho1} ρ2={rho2} ρ_H={rho_H}  state_dim={state_dim}")
 
-    print(f"Loading frozen CQ-VAE from {args.vae_ckpt} ...")
+    print(f"Loading frozen VAE from {args.vae_ckpt} ...")
     vck = torch.load(args.vae_ckpt, map_location=device, weights_only=False)
     action_dim = vck.get('action_dim', 6)
-    vae   = ActionRQUNet1d(action_dim=action_dim, vq_cls=VQ1d_EMA).to(device)
+    vae_kind   = vck.get('kind', 'cqvae')
+    if vae_kind == 'vqvae':
+        vae = ActionVQVAE1d(action_dim=action_dim, vq_cls=VQ1d_EMA).to(device)
+    else:
+        vae = ActionRQUNet1d(action_dim=action_dim, vq_cls=VQ1d_EMA).to(device)
     revin = RevIN(action_dim).to(device)
     vae.load_state_dict(vck['vae']); revin.load_state_dict(vck['revin']); vae.eval(); revin.eval()
+    seq_lens = tuple(vae.seq_lens)
+    K = vae.vqs[0].K
+    print(f"  VAE: kind={vae_kind}  levels={seq_lens}  K={K}")
 
     aggregator = LayerAggregator(hidden_dim=VIS_HIDDEN_DIM, n_layers=25).to(device)
     resampler  = PerceiverResampler(input_dim=VIS_HIDDEN_DIM, dim=trained_dim,
                                     num_latents=NUM_RESAMPLER_LATENTS).to(device)
     policy = STRMPolicy(
-        seq_lens=tuple(SEQ_LENS_1D), k_codebook=vae.vq1.K,
+        seq_lens=seq_lens, k_codebook=K,
         dim=trained_dim, heads=8, depth=trained_depth,
         L_inner=trained_L, H_outer=trained_H,
         rho1_target=rho1, rho2_target=rho2, rho_H_target=rho_H,
@@ -104,12 +111,12 @@ def main():
         return resampler(aggregator(layers))
 
     def decode_action(idxs):
-        i_L0, i_L1, i_L2 = idxs
-        B = i_L0.shape[0]
-        e3 = vae.vq3.emb(i_L0).view(B, SEQ_LENS_1D[0], vae.vq3.D).permute(0, 2, 1)
-        e2 = vae.vq2.emb(i_L1).view(B, SEQ_LENS_1D[1], vae.vq2.D).permute(0, 2, 1)
-        e1 = vae.vq1.emb(i_L2).view(B, SEQ_LENS_1D[2], vae.vq1.D).permute(0, 2, 1)
-        return vae.decode([e3, e2, e1]).transpose(1, 2)
+        """idxs: list of (B, T_l) per level, coarsest-first."""
+        B = idxs[0].shape[0]
+        embs = []
+        for vq, T_l, idx in zip(vae.vqs, vae.seq_lens, idxs):
+            embs.append(vq.emb(idx).view(B, T_l, vq.D).permute(0, 2, 1))
+        return vae.decode(embs).transpose(1, 2)
 
     def topk_correct(logits_l, gt_l, k):
         topk = logits_l.topk(k, dim=-1).indices
@@ -139,37 +146,39 @@ def main():
             })
 
     def eval_at(L, H):
-        topk_correct_per_lvl = {l: {k: 0 for k in TOPK} for l in range(len(SEQ_LENS_1D))}
-        total_per_lvl = [0] * len(SEQ_LENS_1D)
+        topk_correct_per_lvl = {l: {k: 0 for k in TOPK} for l in range(len(seq_lens))}
+        total_per_lvl = [0] * len(seq_lens)
         mse_pol = mse_full = mse_vae = 0.0; n_chunks = 0
         with torch.no_grad():
             for s in cached:
                 all_logits = policy(None, s['vis'], s['state'], mask_list=None,
                                     n_outer=H, n_inner=L)
                 final = all_logits[-1]
-                for l, T_l in enumerate(SEQ_LENS_1D):
+                for l, T_l in enumerate(seq_lens):
                     for k in TOPK:
                         topk_correct_per_lvl[l][k] += topk_correct(final[l], s['gt'][l], k)
                     total_per_lvl[l] += T_l
-                pred_idx = [final[l].argmax(-1) for l in range(len(SEQ_LENS_1D))]
+                pred_idx = [final[l].argmax(-1) for l in range(len(seq_lens))]
                 pred_recon = decode_action(pred_idx)
                 mse_pol  += ((pred_recon - s['gt_recon']) ** 2).mean().item()
                 mse_full += ((pred_recon - s['action_norm']) ** 2).mean().item()
                 mse_vae  += ((s['gt_recon'] - s['action_norm']) ** 2).mean().item()
                 n_chunks += 1
         topk_acc = {l: {k: topk_correct_per_lvl[l][k] / max(total_per_lvl[l], 1) for k in TOPK}
-                    for l in range(len(SEQ_LENS_1D))}
+                    for l in range(len(seq_lens))}
         return {'topk': topk_acc,
                 'mse_policy': mse_pol / n_chunks,
                 'mse_full':   mse_full / n_chunks,
                 'mse_vae':    mse_vae / n_chunks}
 
     print(f"\nH-scaling eval on {N} samples (L fixed at trained={trained_L})\n")
-    print("=" * 92)
-    print(f"  {'H':>3}  {'time':>5}   "
-          f"{'L0 top1/5/10':>16}  {'L1 top1/5/10':>16}  {'L2 top1/5/10':>16}  "
+    n_lvls = len(seq_lens)
+    header_cells = "  ".join(f"{'L%d top1/5/10' % l:>16}" for l in range(n_lvls))
+    bar_w = max(92, 36 + n_lvls * 18)
+    print("=" * bar_w)
+    print(f"  {'H':>3}  {'time':>5}   {header_cells}  "
           f"{'mse_pol':>8}  {'mse_full':>8}")
-    print("-" * 92)
+    print("-" * bar_w)
 
     results = []
     for H in H_GRID:
@@ -177,10 +186,10 @@ def main():
         r = eval_at(trained_L, H)
         elapsed = time.perf_counter() - t0
         cells = ["/".join(f"{r['topk'][l][k]*100:.0f}" for k in TOPK)
-                 for l in range(len(SEQ_LENS_1D))]
+                 for l in range(n_lvls)]
+        cell_str = "  ".join(f"{c:>16}" for c in cells)
         marker = "  ←train" if H == trained_H else ""
-        print(f"  {H:>3}  {elapsed:>5.1f}s   "
-              f"{cells[0]:>16}  {cells[1]:>16}  {cells[2]:>16}  "
+        print(f"  {H:>3}  {elapsed:>5.1f}s   {cell_str}  "
               f"{r['mse_policy']:>8.4f}  {r['mse_full']:>8.4f}{marker}")
         results.append((H, r))
 
@@ -191,9 +200,10 @@ def main():
     H, r = best
     print(f"\n  Best by mse_policy: H={H}, mse_pol={r['mse_policy']:.4f}, "
           f"mse_full={r['mse_full']:.4f}")
-    print(f"     top-1 mean: {sum(r['topk'][l][1] for l in range(3))/3*100:.1f}%   "
-          f"top-5 mean: {sum(r['topk'][l][5] for l in range(3))/3*100:.1f}%   "
-          f"top-10 mean: {sum(r['topk'][l][10] for l in range(3))/3*100:.1f}%")
+    n_lvls = len(seq_lens)
+    print(f"     top-1 mean: {sum(r['topk'][l][1] for l in range(n_lvls))/n_lvls*100:.1f}%   "
+          f"top-5 mean: {sum(r['topk'][l][5] for l in range(n_lvls))/n_lvls*100:.1f}%   "
+          f"top-10 mean: {sum(r['topk'][l][10] for l in range(n_lvls))/n_lvls*100:.1f}%")
 
 
 if __name__ == '__main__':
