@@ -48,7 +48,7 @@ The frozen VAE provides two things to the policy:
   Used as the cross-entropy distribution when `--snce` is set; v3 uses plain
   CE on hard targets (SNCE was strictly worse on this dataset).
 
-## 3. The policy: S-TRM v3
+## 3. The policy: additive closed-form-decay TRM
 
 The policy joins three sources of information through cross-attention:
 
@@ -57,93 +57,77 @@ The policy joins three sources of information through cross-attention:
 [ L0 (4) | L1 (8) | L2 (16) ]                ←  query stream (28 action tokens)
 ```
 
-It maintains **two state streams** `x1, x2 ∈ ℝ^{B × 28 × d}` and runs a
-recursive update with deep supervision over the outer cycles.
+It is **vanilla TRM** — two vector latents `z_H` (solution) and `z_L`
+(reasoning), `z ∈ ℝ^{B × 28 × d}`, one shared tiny net `g`, L inner / H outer
+recursions, deep supervision — with one change: the latents are refined
+**additively with a decaying weight** instead of replaced. Convergence comes
+from the *update rule*, not from constraining the network, so the recurrence
+needs no contraction / spectral norm / Lipschitz bound.
 
 ### 3.1 Building blocks
 
-- **ScaleNorm** (Nguyen & Salazar 2019): single-scalar L2 rescale —
-  cheaper than LayerNorm and just as stable here.
-- **GeGLU** (Shazeer 2020): `GeLU(W₁x) ⊙ W₂x → W₃` — used in G.
-- **Contraction mechanism (`lipschitz` knob):**
-  - `'none'` (default) — *soft contraction*. F/G weights are free; the
-    recurrence relies on the Parcae decay (Ā<1), the 1/L averaging, the
-    convex-combo gates, and ScaleNorm + QK-norm keeping `Lip(F)` ≈ O(1).
-    No power iteration, maximal expressivity. Not a strict 1-Lipschitz
-    proof — the convex gate is non-expansive only if `Lip(f) ≤ 1`, which
-    the activation norms don't guarantee; the contraction margin comes from
-    `max(Ā) + Lip(F)/L < 1`. Monitored empirically via the eval H-scaling.
-  - `'spectral'` — strict. Every F/G linear wrapped in Miyato spectral norm
-    (`σ_max=1`), giving a provable 1-Lipschitz transition at the cost of a
-    power iteration per forward. The original v3 mechanism.
+- **ScaleNorm** (Nguyen & Salazar 2019): single-scalar L2 rescale, used to
+  pre-norm each sub-layer inside `g`.
 - **Vanilla attention** (QK-norm + plain softmax): no softmax-1 / zero-sink.
   A head that wants to abstain routes mass to the cross-attention KV prefix
-  (vision + state) in the same F block — the prefix provides the
-  "dump elsewhere" capacity the sink was emulating.
-- **Convex-combo residual** (instead of the usual additive one):
-  `h ← (1-α) h + α f(h)` with `α = sigmoid(α_logit)`, init at `α ≈ 0.9`.
-  Non-expansive iff the branch is ≤1-Lipschitz; combined with Parcae it
-  drives the contraction.
-- **F block:** ScaleNorm → SelfAttn (over the 28 action tokens) → conv-combo,
-  ScaleNorm → CrossAttn (over `[vis|state]`) → conv-combo.
-- **G block:** ScaleNorm → GeGLU → conv-combo.
+  (vision + state).
+- **GeGLU** (Shazeer 2020): `GeLU(W₁x) ⊙ W₂x → W₃`.
+- **Shared tiny net `g`** (`depth` sub-blocks of SelfAttn → CrossAttn →
+  GeGLU, each pre-ScaleNorm). `g` returns the **sum of its sub-layer
+  transforms** — a *pure update direction*, no identity pass-through. The
+  accumulation of `g`-outputs is itself the residual stream. One `g` is
+  reused for every inner and outer step (TRM "tiny shared net").
 
-`depth=2` means `F = F₂ ∘ F₁` and `G = G₂ ∘ G₁`, i.e. each inner step applies
-two F-blocks (for x1) and two G-blocks (for x2).
+### 3.2 Closed-form decay weights
 
-### 3.2 Parcae channel-wise contraction (Ā)
-
-For each stream we learn a per-channel decay `Ā ∈ (0,1)^d`:
+Each loop refines its latent by a *decaying weighted sum* of the transforms.
+The weights are a **closed form in the loop length** `n` (= L or H):
 
 ```
-Ā = exp(-|Δ| · exp(Ã))
+a_t = ρ^{ t / (n-1) } = ρ^{linspace(0,1,n)_t} ,    t = 0,…,n-1
 ```
 
-Initialized so that the channel-wise mean equals a target ρ:
-`ρ₁=0.75` (slow stream), `ρ₂=0.65` (fast stream), `ρ_H=0.85` (outer y_embed).
-This is the same parameterization Mamba uses for selective state-space
-contraction (Gu & Dao 2024) — guarantees `Ā ∈ (0, 1)^d` for any value of
-`Ã, Δ`, while keeping the channel-wise dynamics learnable.
+`a_0 = 1` (full-weight first step), `a_{n-1} = ρ` exactly (last step), and the
+profile in loop-fraction `t/(n-1)` is identical for any `n`. `ρ_L`, `ρ_H` are
+a single learnable scalar per loop (sigmoid → (0,1)); only the *rate* is
+learned. Because `a_t` is monotone-decreasing and the loop is a finite sum of
+bounded transforms, the accumulation is bounded for any `n` — and the same
+refinement curve is sampled at however many points the step budget gives, so
+test-time L/H scaling is stable by construction (no contraction needed).
 
 ### 3.3 Inner recurrence (L steps)
 
 ```
-for ℓ = 1..L:
-    x1 = Ā₁ ⊙ x1 + (1/L) · F(x2 + y_embed, kv)
-    x2 = Ā₂ ⊙ x2 + (1/L) · G(x1 + y_embed)
+z_L = 0
+for t = 0..L-1:
+    z_L = z_L + a_t^{(L)} · g(z_L + z_H + y, kv)      # a_t = ρ_L^{t/(L-1)}
 ```
 
-The `1/L` scaling is the key that makes increasing L *not* blow up the
-update magnitude — the residual is averaged over the L steps so the overall
-contribution stays O(1). The fixed-point map's Lipschitz constant is
-`≤ max(Ā) + Lip(F)/L`; with Ā ∈ (0,1) and a bounded `Lip(F)` (strictly via
-`lipschitz='spectral'`, softly via ScaleNorm + QK-norm under `'none'`) this
-is < 1, so unrolling more steps just refines the solution. v3 trains at L=5
-and eval generalizes to higher L without retraining (paper §8).
+`g`'s input is the *accumulated-so-far* reasoning latent `z_L` plus the
+current solution `z_H` and the task embedding `y`; it cross-attends to the
+vision/state KV. The first step (`z_L = 0`) already sees full conditioning,
+so the front-loaded `a_t` schedule is coarse-to-fine, not blind. `z_L` is
+re-derived fresh each outer cycle (TRM: the answer persists, the reasoning is
+recomputed).
 
 ### 3.4 Outer recurrence (H cycles)
 
 ```
-y_embed = init(target, mask)                # masked → MASK row, unmasked → E[gt]
-x1 = x2 = 0
-for h = 1..H:
-    x1, x2 = inner_loop(x1, x2, y_embed, kv, L)
-    logits = head(x1)
-    if h < H:
-        candidate = build_y(logits, mask, target)   # soft mixture at masked
-        y_embed   = Ā_H ⊙ y_embed + (1/H) · candidate
+z_H = 0
+for h = 0..H-1:
+    z_L = inner_loop(z_H, y, kv, L)                  # §3.3
+    z_H = z_H + a_h^{(H)} · g(z_H + z_L + y, kv)      # a_h = ρ_H^{h/(H-1)}
+    logits_h = head(z_H)                             # deep supervision each h
 ```
 
-Two important pieces:
+`z_H` is the running solution latent — it accumulates decayed updates across
+the H cycles and is read by the head at every cycle. Because the head reads
+the **raw** `z_H` (no norm), the logit magnitude grows as `z_H` sharpens over
+cycles: more compute → more confident predictions.
 
-- **Outer Parcae** (`Ā_H`): the same channel-wise contraction applied to the
-  outer `y_embed` update, paired with `1/H` scaling on the candidate. v2
-  used a hard replacement `y_embed = candidate` and was unstable as H grew;
-  v3's stable update lets the same model run at H=12 at eval and the
-  predictions only sharpen.
 - **Stochastic-H training**: per call, sample `H ~ Uniform{1..h_max}` with
-  `h_max=12`. This unlocks test-time scaling — without it, the model overfits
-  to the exact H it was trained at.
+  `h_max=12`. Combined with the step-count-invariant weight profile, this
+  makes test-time H scaling behave — the model isn't tied to one H.
 
 ### 3.5 Loss and training signal
 
@@ -153,16 +137,17 @@ Cross-entropy is applied at **every cycle** (deep supervision):
 loss = (1/H) · Σ_h (1/n_levels) · Σ_l avg_masked_CE(logits_h^l, target^l)
 ```
 
-CE only counts masked positions — the rest are teacher-forced via
-`target_embedding`. v3 uses plain CE on hard targets (`--no-snce`).
+CE only counts masked positions — the rest are teacher-forced via the input
+embedding `y`. Default recipe uses plain CE on hard targets (`--no-snce`);
+SNCE soft targets are also supported.
 
-The head predicts **K+1 classes** — the K real codes plus a MASK class at
-index K. MASK is a genuine codebook entry, so the masked-position input
-embedding is a real convex combination over {K codes + MASK}: the MASK
-vertex on the first cycle, then `Σ softmax(logits)·E` thereafter (one
-consistent simplex, no separate `e_init` vector). The GT is never MASK, so
-the CE drives `P(MASK) → 0` automatically; argmax / top-k / action-decode
-all restrict to the K real columns.
+The head predicts the **K real codes** (a plain Linear, no norm). The
+prediction lives in the latent `z_H` (TRM-style latent feedback), so it is
+*not* re-embedded from the logits — the input `y` is a static MASK-marker /
+GT embedding (MASK is one extra learned row used only to mark unknown
+positions, never a prediction target). The mask-ratio curriculum (§3.7)
+trains the model to fill in fully-masked sequences from vision+state context,
+which is the deployment case.
 
 ### 3.6 Optional auxiliary loss: action-space MSE through the frozen decoder
 
@@ -245,20 +230,23 @@ schedule (and pairs cleanly with either contraction mode).
 
 ## 6. Test-time scaling
 
-The model trained at `L=5, h_max=12` keeps improving up to `H=12` at eval,
-typically peaking around `H=4-6` on cold all-masked queries. The contraction
-that makes this work:
+Stability under more L/H steps at eval is built into the **update rule**, not
+enforced on the network:
 
-- Ā ∈ (0,1)^d (Parcae) — the dominant, always-on state decay
-- 1/L · 1/H averaging — keeps each update O(1)
-- Convex-combo residual is non-expansive when the sublayer is ≤1-Lipschitz
-- `lipschitz='spectral'` makes σ_max(F), σ_max(G) ≤ 1 exactly (strict);
-  `'none'` relies on ScaleNorm + QK-norm to keep Lip(F) ≈ O(1) (soft).
-  Either way, watch the H-scaling curve: if accuracy *drops* as H climbs,
-  the recurrence is expanding and the strict mode (or a smaller Ā) is needed.
+- Each loop's output is a decaying weighted sum `Σ_t a_t·g(·)` with
+  `a_t = ρ^{t/(n-1)}` — a bounded sum of bounded transforms for any `n`, so
+  the accumulation cannot blow up no matter how many steps you run.
+- The weight *profile* in loop-fraction `t/(n-1)` is identical for every `n`,
+  so running more steps samples the same refinement curve more finely rather
+  than changing its character — the model trained at one (L,H) generalizes to
+  larger (L,H) at eval. Stochastic-H training (`H~U{1..h_max}`) reinforces this.
+- Because the head reads the raw accumulated `z_H`, more outer compute yields
+  a larger-magnitude (sharper) prediction — verified `|logits|` grows
+  monotonically across cycles and with total H, finite at every H.
 
-So unrolling at higher H is mathematically equivalent to running more
-fixed-point iterations of the same map.
+Practically: watch the eval H-scaling curve. Accuracy should be non-decreasing
+as H grows; if it *drops*, the codebook or conditioning is the bottleneck, not
+the recurrence (which is bounded by construction).
 
 ---
 

@@ -2,8 +2,8 @@
 
 Named recipes ship with `scripts/train_policy.py`:
 
-- **v3** — Pareto-best (current default). Plain CE, depth=2/dim=768, outer
-  Parcae 1/H, mask curriculum, stochastic-H training.
+- **v3** — current default. Plain CE, depth=2/dim=768, additive
+  closed-form-decay updates (a_t=ρ^(t/(n-1))), mask curriculum, stochastic-H.
 - **v4** — v3 + MSE-decode auxiliary loss in *corrected* form (expectation
   mode, all H cycles, small β). The original v4 (argmax-STE, final-cycle
   only, β=0.1) actively regressed mse_pol — see "v4 lesson" below.
@@ -27,7 +27,7 @@ python -m scripts.train_policy \
   --steps 25000 \
   --depth 2 --dim 768 \
   --L-inner 5 --H-outer 4 --h-max 12 \
-  --rho1 0.75 --rho2 0.65 --rho-H 0.85 \
+  --rho-L 0.1 --rho-H 0.1 \
   --lr 9.5e-4 \
   --no-snce \
   --tau-anneal-frac 0.4 \
@@ -64,7 +64,7 @@ python -m scripts.train_policy \
   --steps 25000 \
   --depth 2 --dim 768 \
   --L-inner 5 --H-outer 4 --h-max 12 \
-  --rho1 0.75 --rho2 0.65 --rho-H 0.85 \
+  --rho-L 0.1 --rho-H 0.1 \
   --lr 9.5e-4 \
   --no-snce --tau-anneal-frac 0.4 \
   --mask-curriculum --mask-curriculum-init 0.3 --mask-curriculum-frac 0.5 \

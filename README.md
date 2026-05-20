@@ -42,9 +42,10 @@ EVS/GAP visual pruning + RQ-VAE + TRM-MaskGIT) is documented under
 *Project history* below. After several training iterations we replaced
 the action codebook (RQ-VAE → 3-level CQ-VAE), removed the GR00T teacher
 distillation pathway, and replaced the swept TRM/MaskGIT decoder with a
-**stabilized recursive policy (S-TRM)** with split-stream Parcae
-contraction, Miyato spectral normalization, and outer-Parcae deep
-supervision. That model is what this repo currently implements.
+**recursive (TRM-style) policy whose two latents are refined by additive,
+closed-form-decaying updates** — convergence comes from the decaying update
+rule rather than from constraining the network. That model is what this
+repo currently implements.
 
 The current model has been tested on the SO-101 78-episode dataset
 (`pavelsimo/SO-101-pick-and-place` + supplements). It is now being
@@ -72,14 +73,14 @@ scripts/               # four CLI entry points
 ├── train_policy.py    # train the policy (default: v3 recipe)
 └── eval_policy.py     # H-scaling top-k accuracy + action-space MSE
 docs/
-├── ARCHITECTURE.md    # full S-TRM derivation
+├── ARCHITECTURE.md    # full TRM derivation
 └── RECIPES.md         # v3 / v4 / v5 recipes side-by-side
 assets/                # preliminary illustrations (see Project history)
 ```
 
 ---
 
-## Architecture (current, S-TRM)
+## Architecture (current — additive closed-form-decay TRM)
 
 A high-level summary follows; the full derivation is in
 `docs/ARCHITECTURE.md`.
@@ -91,27 +92,46 @@ The policy joins three sources of information through cross-attention:
 [ L0 (4) | L1 (8) | L2 (16) ]                ←  query stream (28 tokens)
 ```
 
-It maintains **two latent streams** `x1, x2 ∈ ℝ^{B × 28 × d}` and runs a
-recursive update with deep supervision over the outer cycles:
+It is **vanilla TRM** — two vector latents `z_H` (solution) and `z_L`
+(reasoning), one shared tiny net `g` (SelfAttn + CrossAttn + GeGLU,
+returning a *pure transform*), L inner / H outer recursions, deep
+supervision — with one change: the latents are refined **additively with a
+decaying weight** instead of replaced:
 
 ```
-inner step  (run L = 5 times):
-  x1 = Ā₁ ⊙ x1 + (1/L) F(x2 + y, kv)    F = SelfAttn ∘ CrossAttn (conv-combo)
-  x2 = Ā₂ ⊙ x2 + (1/L) G(x1 + y)        G = GeGLU FFN (conv-combo)
-
-outer step  (run H times, deep supervision per cycle):
-  logits = head(x1)
-  y      = Ā_H ⊙ y + (1/H) candidate(logits, mask, gt)
+z_H = 0
+for h in 0..H-1:                                       # outer
+    z_L = 0
+    for t in 0..L-1:                                   # inner
+        z_L = z_L + a_t · g(z_L + z_H + y, kv)
+    z_H = z_H + a_h · g(z_H + z_L + y, kv)
+    logits_h = head(z_H)                               # deep supervision
 ```
 
-Stability mechanisms (all load-bearing — they let H be increased at eval
-without the recurrence diverging):
+The weights are a **closed form in the loop length** (separate rate per loop):
 
-- **Miyato spectral normalization** on every linear (`σ_max(W) = 1`).
-- **Parcae per-channel contraction** `Ā = exp(-|Δ|·exp(Ã)) ∈ (0,1)^d`,
-  initialized at target ρ values per stream.
-- **Convex-combo residual gates** `h ← (1-α)h + α·f(h)`, α ≈ 0.9 init.
-- **Softmax-1 attention sink** so heads can abstain cleanly.
+```
+a_t = ρ^(t/(n-1)) = ρ^linspace(0,1,n)        n = L (inner) or H (outer)
+```
+
+`a_0 = 1`, `a_(n-1) = ρ` exactly; the profile in loop-fraction `t/(n-1)` is
+identical for any `n`, so each loop completes the same refinement over
+whatever step budget it is given — **stable test-time L/H scaling by
+construction** (a bounded weighted sum of bounded transforms; no
+contraction / spectral norm / Lipschitz bound needed). `ρ_L`, `ρ_H` are a
+single learnable scalar per loop (sigmoid → (0,1)); only the *rate* is
+learned, the decaying/bounded structure holds for every ρ ∈ (0,1).
+
+The decoding head reads the **raw** accumulated latent (no norm), so logit
+magnitude grows as the latent sharpens over cycles — more compute → more
+confident predictions. Predictions flow through the latent `z_H`
+(TRM-style); the input `y` is a static MASK-marker / GT embedding, and the
+mask-ratio curriculum (0.3 → 1.0) trains the all-masked cold-start case.
+
+No "stability machinery": the earlier S-TRM's Miyato spectral norm, Parcae
+per-channel state-decay, convex-combo gates, and softmax-1 attention sink
+are all gone — convergence comes from the decaying *update rule*, not from
+constraining the network.
 
 Action codebook: a **3-level convolutional CQ-VAE** (4 / 8 / 16 tokens,
 K=128 each), with RevIN normalization and EMA codebook updates. A
@@ -170,8 +190,8 @@ Outputs from a full run:
 | `oxe_vision_cache/` | int8 InternVL3 features for the chosen episodes |
 | `oxe_vae_revin.pt` | 3-level CQ-VAE codebook |
 | `oxe_vqvae.pt` | single-level VQ-VAE codebook |
-| `oxe_strm_v5.pt` | S-TRM policy trained against the CQ-VAE |
-| `oxe_strm_v5_vqvae.pt` | S-TRM policy trained against the VQ-VAE |
+| `oxe_strm_v5.pt` | TRM policy trained against the CQ-VAE |
+| `oxe_strm_v5_vqvae.pt` | TRM policy trained against the VQ-VAE |
 
 The two policy checkpoints share the same v5 hyperparameters, training
 steps, and visual cache — so the only variable between them is the
