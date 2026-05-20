@@ -9,9 +9,9 @@ Pipeline:
                                 supervision over H outer cycles
   CQ-VAE (frozen) provides per-level (hard, soft) targets via encode_with_soft.
 
-v3 default recipe (matches the strongest run on the 78-episode SO-101 dataset):
+Default recipe:
   --depth 2 --dim 768 --L-inner 5 --H-outer 4 --h-max 12
-  --rho1 0.75 --rho2 0.65 --rho-H 0.85
+  --gamma-L 0.7 --gamma-H 0.7    (additive geometric-decay TRM updates)
   --mask-curriculum --mask-curriculum-init 0.3 --mask-curriculum-frac 0.5
   --no-snce --tau-anneal-frac 0.4 --lr 9.5e-4
 
@@ -58,10 +58,12 @@ def main():
     ap.add_argument('--dim',    type=int,   default=768)
     ap.add_argument('--L-inner', type=int,  default=5)
     ap.add_argument('--H-outer', type=int,  default=4)
-    ap.add_argument('--rho1',   type=float, default=0.75)
-    ap.add_argument('--rho2',   type=float, default=0.65)
-    ap.add_argument('--rho-H',  type=float, default=0.85)
-    ap.add_argument('--alpha-init', type=float, default=0.9)
+    ap.add_argument('--rho-L', type=float, default=0.1,
+                    help="Initial inner-loop decay rate; closed-form weights "
+                         "a_t = ρ_L^(t/(L-1)). Single learnable scalar in (0,1).")
+    ap.add_argument('--rho-H', type=float, default=0.1,
+                    help="Initial outer-loop decay rate; closed-form weights "
+                         "a_h = ρ_H^(h/(H-1)). Single learnable scalar in (0,1).")
     ap.add_argument('--h-max',  type=int,   default=12,
                     help="Train with H ~ U{1..h_max} per call. Unlocks "
                          "test-time scaling beyond the training depth.")
@@ -178,9 +180,7 @@ def main():
         seq_lens=seq_lens, k_codebook=K,
         dim=args.dim, heads=8, depth=args.depth,
         L_inner=args.L_inner, H_outer=args.H_outer,
-        rho1_target=args.rho1, rho2_target=args.rho2,
-        rho_H_target=args.rho_H,
-        alpha_init=args.alpha_init,
+        rho_L=args.rho_L, rho_H=args.rho_H,
         max_prefix=NUM_RESAMPLER_LATENTS + 16, state_dim=state_dim,
     ).to(device)
 
@@ -194,9 +194,9 @@ def main():
           if args.mask_curriculum else "uniform [1/T, 1.0]")
     print(f"  Aggregator: {n_agg:.2f}M  Resampler: {n_res:.2f}M  "
           f"Policy: {n_pol:.2f}M", flush=True)
-    print(f"  S-TRM: depth={args.depth}  dim={args.dim}  L={args.L_inner}  "
-          f"{h_str}  ρ1={args.rho1} ρ2={args.rho2} ρ_H={args.rho_H}  "
-          f"spectral_norm=Miyato (‖W‖₂=1)", flush=True)
+    print(f"  TRM: depth={args.depth}  dim={args.dim}  L={args.L_inner}  "
+          f"{h_str}  ρ_L0={args.rho_L} ρ_H0={args.rho_H} (learnable)  "
+          f"additive closed-form updates (a_t=ρ^(t/(n-1)))", flush=True)
     aux_str = ""
     if args.mse_decode_weight > 0:
         aux_str = (f" + β={args.mse_decode_weight}·MSE_decode("
@@ -274,7 +274,8 @@ def main():
                 all_logits = policy(None, vis, state, mask_list=None)
                 final = all_logits[-1]
                 for l in range(len(seq_lens)):
-                    preds = final[l].argmax(-1)
+                    # head emits K+1 logits (last = MASK); compare real codes only
+                    preds = final[l][..., :K].argmax(-1)
                     correct_per_lvl[l] += (preds == indices[l]).sum().item()
                     total_per_lvl[l]   += seq_lens[l]
         policy.train(); aggregator.train(); resampler.train()
@@ -290,7 +291,7 @@ def main():
             'seq_lens': list(seq_lens), 'k': K, 'vae_kind': vae_kind,
             'L_inner': args.L_inner, 'H_outer': args.H_outer,
             'depth': args.depth, 'dim': args.dim,
-            'rho1': args.rho1, 'rho2': args.rho2, 'rho_H': args.rho_H,
+            'rho_L': args.rho_L, 'rho_H': args.rho_H,
             'action_dim': action_dim, 'state_dim': state_dim,
             'dataset': args.dataset,
             'oxe_dataset_id': args.oxe_dataset_id if args.dataset == 'oxe' else None,
@@ -356,10 +357,13 @@ def main():
                 e_in = []
                 for l, lg in enumerate(cycle_logits):
                     E = vqs[l].emb.weight                        # (K, D_l)
-                    soft = torch.softmax(lg, dim=-1)             # (B, T_l, K)
+                    # policy head emits K+1 (last = MASK); the VAE codebook has
+                    # only the K real codes, so softmax over the real columns.
+                    lg_real = lg[..., :E.shape[0]]               # (B, T_l, K)
+                    soft = torch.softmax(lg_real, dim=-1)        # (B, T_l, K)
                     e_soft = soft @ E                            # (B, T_l, D_l)
                     if args.mse_decode_mode == 'argmax':
-                        idx = lg.argmax(-1)
+                        idx = lg_real.argmax(-1)
                         e_hard = E[idx]
                         e_pred = e_soft + (e_hard - e_soft).detach()
                     else:
@@ -392,19 +396,13 @@ def main():
                    for l in range(n_lvls)]
             mean_acc = (sum(win_correct) / sum(win_total)) if sum(win_total) > 0 else 0.0
             with torch.no_grad():
-                A1, A2 = policy._A_bar()
-                A_H = policy._A_H()
-                rho1 = A1.mean().item(); rho2 = A2.mean().item(); rhoH = A_H.mean().item()
-                asa = torch.stack([torch.sigmoid(fb.alpha_sa) for fb in policy.f_blocks]).mean().item()
-                aca = torch.stack([torch.sigmoid(fb.alpha_ca) for fb in policy.f_blocks]).mean().item()
-                ag  = torch.stack([torch.sigmoid(gb.alpha)    for gb in policy.g_blocks]).mean().item()
+                rL, rH = policy._rhos()
             mse_dec_str = (f"  mse_dec={win_mse_decode/win_steps:.3f}"
                            if args.mse_decode_weight > 0 else "")
             print(f"  step {step:>6}/{args.steps}  loss={win_loss/win_steps:.3f}{mse_dec_str}  "
                   f"acc={mean_acc*100:.1f}% [L0/L1/L2={'/'.join(f'{a*100:.1f}' for a in per)}]  "
                   f"tau={tau:.3f}  rmax={rmax:.2f}  lr={cur_lr:.1e}  "
-                  f"ρ1={rho1:.3f} ρ2={rho2:.3f} ρH={rhoH:.3f}  "
-                  f"α(sa/ca/g)={asa:.2f}/{aca:.2f}/{ag:.2f}  "
+                  f"ρ_L={rL.item():.3f} ρ_H={rH.item():.3f}  "
                   f"mem={mem:.1f}GB  [{elapsed:.0f}s]", flush=True)
             win_correct = [0] * n_lvls; win_total = [0] * n_lvls
             win_loss = 0.0; win_mse_decode = 0.0; win_steps = 0

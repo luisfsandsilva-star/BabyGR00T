@@ -3,9 +3,10 @@
 This document describes the policy used in `babygroot_strm`. It is a
 **stabilized, recursive** vision-language-action model that operates over a
 discrete codebook produced by a frozen 3-level CQ-VAE. The recursion is
-contractive by construction (Miyato spectral norm + Parcae channel-wise
-contraction + convex-combo residuals), so the same checkpoint works at much
-larger H at inference time than it was trained at.
+contractive by construction (Parcae channel-wise decay + 1/L averaging +
+convex-combo gates, optionally tightened with Miyato spectral norm — see
+§3.1), so the same checkpoint works at much larger H at inference time than
+it was trained at.
 
 ---
 
@@ -64,19 +65,25 @@ recursive update with deep supervision over the outer cycles.
 - **ScaleNorm** (Nguyen & Salazar 2019): single-scalar L2 rescale —
   cheaper than LayerNorm and just as stable here.
 - **GeGLU** (Shazeer 2020): `GeLU(W₁x) ⊙ W₂x → W₃` — used in G.
-- **Miyato spectral normalization**: every linear is wrapped with
-  `torch.nn.utils.parametrizations.spectral_norm`, so its operator norm
-  `σ_max(W) = 1` exactly (one power-iteration step per forward, warm-started
-  across calls). This is the load-bearing stability mechanism — it removes
-  the σ-cap threshold that earlier versions had to tune.
-- **Softmax-1 attention sink** (Miller, "Attention Is Off By One", 2023):
-  one zero-key + zero-value column appended to K and V before SDPA, so the
-  softmax denominator gains an `exp(0)=1` term and heads can abstain
-  cleanly without spreading mass across real keys.
+- **Contraction mechanism (`lipschitz` knob):**
+  - `'none'` (default) — *soft contraction*. F/G weights are free; the
+    recurrence relies on the Parcae decay (Ā<1), the 1/L averaging, the
+    convex-combo gates, and ScaleNorm + QK-norm keeping `Lip(F)` ≈ O(1).
+    No power iteration, maximal expressivity. Not a strict 1-Lipschitz
+    proof — the convex gate is non-expansive only if `Lip(f) ≤ 1`, which
+    the activation norms don't guarantee; the contraction margin comes from
+    `max(Ā) + Lip(F)/L < 1`. Monitored empirically via the eval H-scaling.
+  - `'spectral'` — strict. Every F/G linear wrapped in Miyato spectral norm
+    (`σ_max=1`), giving a provable 1-Lipschitz transition at the cost of a
+    power iteration per forward. The original v3 mechanism.
+- **Vanilla attention** (QK-norm + plain softmax): no softmax-1 / zero-sink.
+  A head that wants to abstain routes mass to the cross-attention KV prefix
+  (vision + state) in the same F block — the prefix provides the
+  "dump elsewhere" capacity the sink was emulating.
 - **Convex-combo residual** (instead of the usual additive one):
   `h ← (1-α) h + α f(h)` with `α = sigmoid(α_logit)`, init at `α ≈ 0.9`.
-  Combined with the ≤1-Lipschitz sublayers this keeps the full F/G stack
-  ≤1-Lipschitz at every depth.
+  Non-expansive iff the branch is ≤1-Lipschitz; combined with Parcae it
+  drives the contraction.
 - **F block:** ScaleNorm → SelfAttn (over the 28 action tokens) → conv-combo,
   ScaleNorm → CrossAttn (over `[vis|state]`) → conv-combo.
 - **G block:** ScaleNorm → GeGLU → conv-combo.
@@ -108,15 +115,16 @@ for ℓ = 1..L:
 
 The `1/L` scaling is the key that makes increasing L *not* blow up the
 update magnitude — the residual is averaged over the L steps so the overall
-contribution stays O(1). With ‖F‖, ‖G‖ ≤ 1 (spectral norm) and Ā ∈ (0,1), the
-fixed-point map is a contraction, so unrolling more steps just refines the
-solution. v3 trains at L=5 — and eval generalizes to higher L without
-retraining (paper §8).
+contribution stays O(1). The fixed-point map's Lipschitz constant is
+`≤ max(Ā) + Lip(F)/L`; with Ā ∈ (0,1) and a bounded `Lip(F)` (strictly via
+`lipschitz='spectral'`, softly via ScaleNorm + QK-norm under `'none'`) this
+is < 1, so unrolling more steps just refines the solution. v3 trains at L=5
+and eval generalizes to higher L without retraining (paper §8).
 
 ### 3.4 Outer recurrence (H cycles)
 
 ```
-y_embed = init(target, mask)                # masked → e_init, unmasked → E[gt]
+y_embed = init(target, mask)                # masked → MASK row, unmasked → E[gt]
 x1 = x2 = 0
 for h = 1..H:
     x1, x2 = inner_loop(x1, x2, y_embed, kv, L)
@@ -147,6 +155,14 @@ loss = (1/H) · Σ_h (1/n_levels) · Σ_l avg_masked_CE(logits_h^l, target^l)
 
 CE only counts masked positions — the rest are teacher-forced via
 `target_embedding`. v3 uses plain CE on hard targets (`--no-snce`).
+
+The head predicts **K+1 classes** — the K real codes plus a MASK class at
+index K. MASK is a genuine codebook entry, so the masked-position input
+embedding is a real convex combination over {K codes + MASK}: the MASK
+vertex on the first cycle, then `Σ softmax(logits)·E` thereafter (one
+consistent simplex, no separate `e_init` vector). The GT is never MASK, so
+the CE drives `P(MASK) → 0` automatically; argmax / top-k / action-decode
+all restrict to the K real columns.
 
 ### 3.6 Optional auxiliary loss: action-space MSE through the frozen decoder
 
@@ -224,18 +240,22 @@ twice in a row.
   removed in v3 — it was redundant with `lr`).
 - **Decoupled weight decay** (`w ← w·(1 - lr·wd)`).
 
-Combined with Miyato spectral norm, LARS gives well-scaled per-parameter
-updates without needing a per-layer lr schedule.
+LARS gives well-scaled per-parameter updates without needing a per-layer lr
+schedule (and pairs cleanly with either contraction mode).
 
 ## 6. Test-time scaling
 
 The model trained at `L=5, h_max=12` keeps improving up to `H=12` at eval,
 typically peaking around `H=4-6` on cold all-masked queries. The contraction
-guarantees this works:
+that makes this work:
 
-- σ_max(F), σ_max(G) ≤ 1 (Miyato spec-norm)
-- Ā ∈ (0,1)^d (Parcae)
-- Convex-combo residual is itself ≤1-Lipschitz when the sublayer is
+- Ā ∈ (0,1)^d (Parcae) — the dominant, always-on state decay
+- 1/L · 1/H averaging — keeps each update O(1)
+- Convex-combo residual is non-expansive when the sublayer is ≤1-Lipschitz
+- `lipschitz='spectral'` makes σ_max(F), σ_max(G) ≤ 1 exactly (strict);
+  `'none'` relies on ScaleNorm + QK-norm to keep Lip(F) ≈ O(1) (soft).
+  Either way, watch the H-scaling curve: if accuracy *drops* as H climbs,
+  the recurrence is expanding and the strict mode (or a smaller Ā) is needed.
 
 So unrolling at higher H is mathematically equivalent to running more
 fixed-point iterations of the same map.

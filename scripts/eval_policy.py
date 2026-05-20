@@ -48,10 +48,10 @@ def main():
     trained_H     = c.get('H_outer', 4)
     trained_depth = c.get('depth',   2)
     trained_dim   = c.get('dim',     768)
-    rho1 = c.get('rho1', 0.75); rho2 = c.get('rho2', 0.65); rho_H = c.get('rho_H', 0.85)
+    rho_L = c.get('rho_L', 0.1); rho_H = c.get('rho_H', 0.1)
     state_dim = c.get('state_dim', c.get('action_dim', 6))
     print(f"  trained: depth={trained_depth} dim={trained_dim} L={trained_L} "
-          f"H={trained_H} ρ1={rho1} ρ2={rho2} ρ_H={rho_H}  state_dim={state_dim}")
+          f"H={trained_H} ρ_L={rho_L} ρ_H={rho_H}  state_dim={state_dim}")
 
     print(f"Loading frozen VAE from {args.vae_ckpt} ...")
     vck = torch.load(args.vae_ckpt, map_location=device, weights_only=False)
@@ -74,7 +74,7 @@ def main():
         seq_lens=seq_lens, k_codebook=K,
         dim=trained_dim, heads=8, depth=trained_depth,
         L_inner=trained_L, H_outer=trained_H,
-        rho1_target=rho1, rho2_target=rho2, rho_H_target=rho_H,
+        rho_L=rho_L, rho_H=rho_H,
         max_prefix=NUM_RESAMPLER_LATENTS + 16, state_dim=state_dim,
     ).to(device)
     aggregator.load_state_dict(c['aggregator'])
@@ -119,7 +119,8 @@ def main():
         return vae.decode(embs).transpose(1, 2)
 
     def topk_correct(logits_l, gt_l, k):
-        topk = logits_l.topk(k, dim=-1).indices
+        # head emits K+1 logits (last = MASK); rank over the real codes only
+        topk = logits_l[..., :K].topk(k, dim=-1).indices
         return (topk == gt_l.unsqueeze(-1)).any(-1).sum().item()
 
     random.seed(42); torch.manual_seed(42)
@@ -158,7 +159,7 @@ def main():
                     for k in TOPK:
                         topk_correct_per_lvl[l][k] += topk_correct(final[l], s['gt'][l], k)
                     total_per_lvl[l] += T_l
-                pred_idx = [final[l].argmax(-1) for l in range(len(seq_lens))]
+                pred_idx = [final[l][..., :K].argmax(-1) for l in range(len(seq_lens))]
                 pred_recon = decode_action(pred_idx)
                 mse_pol  += ((pred_recon - s['gt_recon']) ** 2).mean().item()
                 mse_full += ((pred_recon - s['action_norm']) ** 2).mean().item()
