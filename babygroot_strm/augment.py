@@ -160,3 +160,131 @@ def build_paraphrase_pool(base_prompts: Sequence[str],
         if bp not in pool:
             pool[bp] = sample_paraphrases(bp, n=n)
     return pool
+
+
+# ════════════════════════════════════════════════════════════
+#  Template-based paraphraser for arbitrary natural-language tasks
+#  (no external API; works on OXE / Bridge V2's ~20k unique strings)
+# ════════════════════════════════════════════════════════════
+
+# "Always-safe" templates: work for ANY task phrasing — imperative,
+# declarative ("the robot picks up X"), passive, telegraphic, fragments, etc.
+# These just wrap the raw task with a label, no grammatical assumption.
+SAFE_TASK_TEMPLATES: list[str] = [
+    "{x}.",
+    "{X}.",                              # capitalised-first variant
+    "Goal: {x}.",
+    "Task: {x}.",
+    "Instruction: {x}.",
+    "Action: {x}.",
+    "Step: {x}.",
+    "Begin: {x}.",
+    "Carry out the following: {x}.",
+    "Complete the task: {x}.",
+    "Execute the following: {x}.",
+    "Now {x}.",                          # benign adverb prefix
+]
+
+# Imperative-required templates: assume `{x}` is a verb-phrase imperative
+# ("pick up the cup", "fold the napkin"). Inserting these around a
+# declarative subject (e.g. "the robot picks up the cup") would yield
+# ungrammatical text like "The robot will the robot picks up the cup."
+IMPERATIVE_TASK_TEMPLATES: list[str] = [
+    "Please {x}.",
+    "Robot, {x}.",
+    "The robot will {x}.",
+    "Use the robot arm to {x}.",
+    "Your task is to {x}.",
+    "Demonstrate how to {x}.",
+    "Show how to {x}.",
+    "The objective is to {x}.",
+]
+
+# Back-compat alias (older code may import this name).
+TASK_PARAPHRASE_TEMPLATES = SAFE_TASK_TEMPLATES + IMPERATIVE_TASK_TEMPLATES
+
+
+# Words that, as the first token of a task, signal a declarative / passive /
+# non-imperative phrasing where imperative-template insertion would produce
+# broken grammar. Lightweight first-word check — no POS tagger needed.
+_NON_IMPERATIVE_STARTERS: frozenset = frozenset({
+    'the', 'a', 'an',
+    'i', 'he', 'she', 'it', 'they', 'you', 'we', 'this', 'that',
+    'these', 'those', 'my', 'your', 'his', 'her', 'their', 'our',
+    'there',
+    'is', 'was', 'are', 'were', 'be', 'been', 'being',
+    'has', 'have', 'had',
+    'will', 'would', 'shall', 'should', 'can', 'could', 'may', 'might',
+})
+
+
+def is_likely_imperative(task: str) -> bool:
+    """Lightweight heuristic. Returns True if the task looks like a verb-
+    phrase imperative (the typical Bridge V2 form: "fold the napkin",
+    "open the drawer"). Returns False for declarative / passive / pronoun-
+    led phrasings where imperative-required templates would break grammar.
+
+    Heuristic: first word must NOT be in _NON_IMPERATIVE_STARTERS, AND must
+    not end in '-ing' (gerund) or '-ed' for common past-tense conjugations.
+    """
+    t = task.strip().lower()
+    if not t:
+        return False
+    first = t.split(maxsplit=1)[0]
+    if first in _NON_IMPERATIVE_STARTERS:
+        return False
+    # Gerund/progressive: "picking up the cup" → not imperative
+    if first.endswith('ing') and len(first) > 4:
+        return False
+    # Past tense -ed: "picked up the cup" → not imperative.
+    # Exclude common base-form verbs that happen to end in -ed (rare in robot
+    # tasks but safer to whitelist a few).
+    if (first.endswith('ed') and len(first) > 3
+        and first not in {'feed', 'speed', 'need', 'seed', 'weed', 'shed',
+                          'shred', 'fled', 'led', 'red', 'sled', 'wed',
+                          'bed', 'bled', 'tread', 'spread', 'embed'}):
+        return False
+    return True
+
+
+def _normalize_task_str(task: str) -> str:
+    """Lowercase first letter and strip trailing punctuation so {x}/{X}
+    interpolation works cleanly inside templates."""
+    t = task.strip().rstrip(' .!?,;')
+    if not t:
+        return t
+    return t[0].lower() + t[1:]
+
+
+def template_paraphrases(task: str, n: int = 4, seed: int = 0) -> list[str]:
+    """Generate `n` template-based paraphrases of any natural-language task
+    string. No external API; works on OXE / Bridge V2's full task vocabulary.
+
+    Robust against non-imperative phrasings: detects whether the task looks
+    like an imperative verb phrase ("fold the napkin") vs a declarative
+    ("the robot folds the napkin") and uses only safe templates for the
+    latter — avoiding grammatically broken outputs like
+    "Use the robot arm to the robot folds the napkin."
+    """
+    t_low = _normalize_task_str(task)
+    t_hi = (t_low[:1].upper() + t_low[1:]) if t_low else t_low
+    pool = list(SAFE_TASK_TEMPLATES)
+    if is_likely_imperative(task):
+        pool += IMPERATIVE_TASK_TEMPLATES
+    rng = random.Random(seed ^ (hash(task) & 0xFFFFFFFF))
+    rng.shuffle(pool)
+    while len(pool) < n:
+        pool.append(rng.choice(pool))
+    return [t.format(x=t_low, X=t_hi) for t in pool[:n]]
+
+
+def build_task_paraphrase_pool(base_prompts: Sequence[str],
+                                n: int = 4) -> dict[str, list[str]]:
+    """Like build_paraphrase_pool but uses template_paraphrases (programmatic)
+    instead of the hand-curated SO-101-specific PARAPHRASE_BANK.  Suitable for
+    OXE datasets with thousands of unique task descriptions."""
+    pool: dict[str, list[str]] = {}
+    for i, bp in enumerate(base_prompts):
+        if bp not in pool:
+            pool[bp] = template_paraphrases(bp, n=n, seed=i)
+    return pool

@@ -45,6 +45,23 @@ def main():
     ap.add_argument('--batch-size', type=int, default=2)
     ap.add_argument('--grad-accum', type=int, default=4)
     ap.add_argument('--num-workers', type=int, default=2)
+    ap.add_argument('--lru-size', type=int, default=16,
+                    help="Per-process LRU cache of decoded vision chunks. The "
+                         "cached hidden tensors are ~95 MB each, so a larger "
+                         "cache (and num_workers=0, to avoid serializing them "
+                         "over worker IPC every step) is the validated "
+                         "throughput config on the slow NTFS-FUSE D: drive.")
+    # Precision: bf16 autocast (AMP) is ON by default on CUDA/ROCm. bf16 has
+    # fp32's exponent range, so it's safe for this additive TRM whose logits
+    # grow unbounded (fp16 would risk overflow); no GradScaler needed.
+    ap.add_argument('--no-amp', dest='amp', action='store_false', default=True,
+                    help="Disable autocast (AMP) and train in fp32.")
+    ap.add_argument('--amp-dtype', choices=['fp16', 'bf16'], default='fp16',
+                    help="Autocast dtype. fp16 is the fast path on RDNA2 (uses "
+                         "a GradScaler); bf16 needs no scaler but is slow on "
+                         "consumer RDNA2. The TRM's z_H/z_L accumulators stay "
+                         "fp32 either way (seeded from fp32 embeddings), so the "
+                         "unbounded-logit accumulation never overflows.")
     # Logging / ckpt
     ap.add_argument('--log-every', type=int, default=200)
     ap.add_argument('--probe-every', type=int, default=1000)
@@ -56,6 +73,14 @@ def main():
     # Architecture (v3 defaults)
     ap.add_argument('--depth',  type=int,   default=2)
     ap.add_argument('--dim',    type=int,   default=768)
+    ap.add_argument('--vis-dim', type=int,  default=None,
+                    help="Resampler output width ('the rest'). If unset, "
+                         "equals --dim (coupled, original behavior). When set "
+                         "(e.g. 768) while --dim is larger, the aggregator + "
+                         "resampler stay at this width and a thin "
+                         "Linear(vis_dim→dim) projects the vision KV up — lets "
+                         "the TRM scale in width without ballooning the "
+                         "resampler (whose params grow as dim²).")
     ap.add_argument('--L-inner', type=int,  default=5)
     ap.add_argument('--H-outer', type=int,  default=4)
     ap.add_argument('--rho-L', type=float, default=0.1,
@@ -131,6 +156,17 @@ def main():
 
     torch.manual_seed(42); np.random.seed(42); random.seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_amp = bool(args.amp) and device.type == 'cuda'
+    amp_dtype = torch.float16 if args.amp_dtype == 'fp16' else torch.bfloat16
+    # fp16 needs gradient scaling (small grads underflow); bf16 doesn't. The
+    # scaler is a no-op when disabled, so the train loop routes through it
+    # unconditionally. z_H/z_L accumulators stay fp32 regardless (see below).
+    amp_scaler = torch.amp.GradScaler(
+        'cuda', enabled=(use_amp and amp_dtype == torch.float16))
+    if use_amp:
+        print(f"  AMP: {args.amp_dtype} autocast  "
+              f"(GradScaler {'on' if amp_scaler.is_enabled() else 'off'}; "
+              f"z_H/z_L accumulators stay fp32)", flush=True)
 
     # ── Frozen action codebook + RevIN (CQ-VAE or VQ-VAE) ──
     print(f"Loading frozen VAE from {args.vae_ckpt} ...", flush=True)
@@ -182,9 +218,15 @@ def main():
           f"CLI override = {args.state_dim})", flush=True)
 
     # ── Vision pipeline + S-TRM policy ──
+    # 'the rest' (aggregator + resampler) lives at vis_dim; the TRM at args.dim.
+    # When vis_dim < dim, a thin Linear projects the resampler KV up to the
+    # policy width so the resampler doesn't have to grow with the TRM.
+    vis_dim = args.vis_dim if args.vis_dim is not None else args.dim
     aggregator = LayerAggregator(hidden_dim=VIS_HIDDEN_DIM, n_layers=25).to(device)
-    resampler  = PerceiverResampler(input_dim=VIS_HIDDEN_DIM, dim=args.dim,
+    resampler  = PerceiverResampler(input_dim=VIS_HIDDEN_DIM, dim=vis_dim,
                                     num_latents=NUM_RESAMPLER_LATENTS).to(device)
+    vis_proj = (torch.nn.Identity() if vis_dim == args.dim
+                else torch.nn.Linear(vis_dim, args.dim)).to(device)
     PolicyCls = STRMPolicyVAE if args.vae_latent else STRMPolicy
     extra = dict(beta=args.beta, free_bits=args.free_bits) if args.vae_latent else {}
     policy = PolicyCls(
@@ -199,13 +241,15 @@ def main():
     n_pol = sum(p.numel() for p in policy.parameters()) / 1e6
     n_agg = sum(p.numel() for p in aggregator.parameters()) / 1e6
     n_res = sum(p.numel() for p in resampler.parameters()) / 1e6
+    n_proj = sum(p.numel() for p in vis_proj.parameters()) / 1e6
     h_str = f"H~U{{1..{args.h_max}}}" if args.h_max else f"H={args.H_outer} fixed"
     loss_kind = "CE" if args.no_snce else "SNCE"
     mc = (f"mask-curriculum {args.mask_curriculum_init}→1.0 over "
           f"{args.mask_curriculum_frac*100:.0f}%"
           if args.mask_curriculum else "uniform [1/T, 1.0]")
-    print(f"  Aggregator: {n_agg:.2f}M  Resampler: {n_res:.2f}M  "
-          f"Policy: {n_pol:.2f}M", flush=True)
+    print(f"  Aggregator: {n_agg:.2f}M  Resampler: {n_res:.2f}M (vis_dim={vis_dim})"
+          f"  vis_proj: {n_proj:.2f}M ({vis_dim}->{args.dim})  "
+          f"Policy[TRM]: {n_pol:.2f}M", flush=True)
     vae_str = (f"  VAE-latent (split μ|ρ, β={args.beta}, free_bits={args.free_bits})"
                if args.vae_latent else "")
     print(f"  TRM: depth={args.depth}  dim={args.dim}  L={args.L_inner}  "
@@ -223,14 +267,14 @@ def main():
     loader = make_loader(args.cache_dir, episodes,
                          batch_size=args.batch_size,
                          num_workers=args.num_workers,
-                         shuffle=True, lru_size=2,
+                         shuffle=True, lru_size=args.lru_size,
                          augment=not args.no_augment,
                          dropout=0.1 if not args.no_augment else 0.0)
     print(f"  {len(loader.dataset)} samples, {len(loader)} batches/epoch", flush=True)
 
     # ── Optimizer ──
     trainable = (list(aggregator.parameters()) + list(resampler.parameters())
-                 + list(policy.parameters()))
+                 + list(vis_proj.parameters()) + list(policy.parameters()))
     opt = MuSGD_LARS(trainable, lr=args.lr, momentum=0.95, weight_decay=1e-4,
                      nesterov=True, ns_steps=5)
     warmup_steps = min(200, args.steps // 10)
@@ -242,12 +286,17 @@ def main():
         rck = torch.load(args.resume, map_location=device, weights_only=False)
         aggregator.load_state_dict(rck['aggregator'])
         resampler.load_state_dict(rck['resampler'])
+        if (rck.get('vis_proj') is not None
+                and not isinstance(vis_proj, torch.nn.Identity)):
+            vis_proj.load_state_dict(rck['vis_proj'])
         policy.load_state_dict(rck['policy'])
         if 'opt' in rck:
             opt.load_state_dict(rck['opt'])
             print("  optimizer state restored")
         else:
             print("  WARNING: no optimizer state — using fresh momentum")
+        if rck.get('amp_scaler') is not None and amp_scaler.is_enabled():
+            amp_scaler.load_state_dict(rck['amp_scaler'])
         resume_step = rck.get('step', 0)
         resume_best_acc = rck.get('best_acc', 0.0)
         print(f"  resuming at step {resume_step}/{args.steps}  "
@@ -255,7 +304,7 @@ def main():
 
     def vis_pipeline(hidden):
         layer_list = [hidden[:, l] for l in range(hidden.shape[1])]
-        return resampler(aggregator(layer_list))
+        return vis_proj(resampler(aggregator(layer_list)))
 
     def encode_codes(action, tau):
         with torch.no_grad():
@@ -277,7 +326,8 @@ def main():
         total_per_lvl   = [0] * len(seq_lens)
         idxs = random.sample(range(len(loader.dataset)),
                              min(n_probe, len(loader.dataset)))
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type=device.type,
+                                             dtype=amp_dtype, enabled=use_amp):
             for idx in idxs:
                 s = loader.dataset[idx]
                 hidden = s['hidden'].unsqueeze(0).to(device)
@@ -296,22 +346,32 @@ def main():
         return [c / max(t, 1) for c, t in zip(correct_per_lvl, total_per_lvl)]
 
     def save_checkpoint(step, best_acc, path):
+        # Atomic write: serialize to a temp file, then os.replace onto the
+        # target. An interrupted save (e.g. SIGTERM mid-step) leaves only the
+        # temp file — it can NEVER clobber the last good ckpt with a partial
+        # write (which is exactly what corrupted a 1.28GB ckpt down to 12MB).
+        tmp = path + '.tmp'
         torch.save({
             'aggregator': aggregator.state_dict(),
             'resampler':  resampler.state_dict(),
+            'vis_proj':   (None if isinstance(vis_proj, torch.nn.Identity)
+                           else vis_proj.state_dict()),
             'policy':     policy.state_dict(),
             'opt':        opt.state_dict(),
+            'amp_scaler': (amp_scaler.state_dict() if amp_scaler.is_enabled()
+                           else None),
             'step': step, 'best_acc': best_acc,
             'seq_lens': list(seq_lens), 'k': K, 'vae_kind': vae_kind,
             'L_inner': args.L_inner, 'H_outer': args.H_outer,
-            'depth': args.depth, 'dim': args.dim,
+            'depth': args.depth, 'dim': args.dim, 'vis_dim': vis_dim,
             'rho_L': args.rho_L, 'rho_H': args.rho_H,
             'vae_latent': args.vae_latent, 'beta': args.beta,
             'free_bits': args.free_bits,
             'action_dim': action_dim, 'state_dim': state_dim,
             'dataset': args.dataset,
             'oxe_dataset_id': args.oxe_dataset_id if args.dataset == 'oxe' else None,
-        }, path)
+        }, tmp)
+        os.replace(tmp, path)
 
     # ── Train ──
     print(f"\nTraining {args.steps} steps  ({loss_kind}) ...", flush=True)
@@ -324,7 +384,15 @@ def main():
 
     def _save_on_exit(signum, frame):
         print(f"\n[signal {signum}] saving checkpoint at step {step}...", flush=True)
-        save_checkpoint(step, best_acc, args.ckpt_path); sys.exit(0)
+        # SIGTERM can land mid-forward; if the save itself errors, the atomic
+        # write protects the last good ckpt — just exit cleanly either way.
+        try:
+            save_checkpoint(step, best_acc, args.ckpt_path)
+            print(f"  saved at step {step}.", flush=True)
+        except Exception as e:
+            print(f"  save-on-exit failed ({e!r}); last periodic ckpt is intact.",
+                  flush=True)
+        sys.exit(0)
     signal.signal(signal.SIGINT, _save_on_exit)
     signal.signal(signal.SIGTERM, _save_on_exit)
 
@@ -344,15 +412,17 @@ def main():
                               anneal_frac=args.tau_anneal_frac)
         indices, soft = encode_codes(action, tau)
         soft_for_loss = None if args.no_snce else soft
-        vis = vis_pipeline(hidden)
         rmax = mask_ratio_max_at(step)
 
-        loss, per_lvl, all_logits = policy.forward_loss(
-            indices, vis, state,
-            soft_targets=soft_for_loss,
-            h_max=args.h_max,
-            mask_ratio_max=rmax,
-        )
+        with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                            enabled=use_amp):
+            vis = vis_pipeline(hidden)
+            loss, per_lvl, all_logits = policy.forward_loss(
+                indices, vis, state,
+                soft_targets=soft_for_loss,
+                h_max=args.h_max,
+                mask_ratio_max=rmax,
+            )
 
         # Auxiliary loss: MSE on the action-space decode of e_pred.
         # Two modes for e_pred (`--mse-decode-mode`):
@@ -391,7 +461,7 @@ def main():
             loss = loss + args.mse_decode_weight * mse_decode
             win_mse_decode += mse_decode.item()
 
-        (loss / args.grad_accum).backward()
+        amp_scaler.scale(loss / args.grad_accum).backward()
 
         for l in range(n_lvls):
             win_correct[l] += per_lvl[l]['mask_correct']
@@ -402,7 +472,8 @@ def main():
             lr_scale = min(1.0, (step / args.grad_accum + 1) / max(warmup_steps, 1))
             for g in opt.param_groups:
                 g['lr'] = args.lr * lr_scale
-            opt.step(); opt.zero_grad(set_to_none=True)
+            amp_scaler.step(opt); amp_scaler.update()
+            opt.zero_grad(set_to_none=True)
 
         if step % args.log_every == 0 or step == 1:
             elapsed = time.perf_counter() - t0

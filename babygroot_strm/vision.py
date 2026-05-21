@@ -146,16 +146,16 @@ class InternVL3Vision(nn.Module):
     def __init__(self, model_id=INTERNVL3_MODEL_ID, device=None):
         super().__init__()
         from PIL import Image  # noqa: F401  (used by callers via the same alias)
-        from transformers import (AutoProcessor, AutoModelForImageTextToText,
-                                  BitsAndBytesConfig)
+        from transformers import AutoProcessor, AutoModelForImageTextToText
         self._device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Loading {model_id} (8-bit) ...")
+        # fp16 on ROCm RDNA2 (RX 6650 XT) — bitsandbytes-rocm 8-bit is broken
+        # on gfx1032; InternVL3-1B in fp16 is ~2 GB and fits 8 GB VRAM easily.
+        print(f"Loading {model_id} (fp16) ...")
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = AutoModelForImageTextToText.from_pretrained(
             model_id,
-            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
-            device_map="auto",
-        ).eval()
+            torch_dtype=torch.float16,
+        ).to(self._device).eval()
         self.img_token_id = self.model.config.image_token_id
 
         vis_cfg = self.model.config.vision_config
@@ -199,10 +199,21 @@ class InternVL3Vision(nn.Module):
         return self._projector(_pixel_unshuffle(vis, self.dr))
 
     def _build_prompt(self, pil_frames, prompt):
-        msgs = [{"role": "user", "content": [
-            {"type": "video", "video": pil_frames},
-            {"type": "text",  "text": prompt},
-        ]}]
+        """Build the chat-template input that matches the official InternVL
+        video format:  "Frame1: <image>\\nFrame2: <image>\\n...\\n{prompt}"
+        The HF chat template inserts image_token_id placeholders for each
+        {"type":"image"} entry; the surrounding "Frame N:" text gives the LLM
+        explicit temporal grounding. We then substitute the actual visual
+        features into the image-token slots in _build_inputs_embeds — same
+        path that worked before, just with proper video scaffolding now.
+        """
+        content = []
+        for i, fr in enumerate(pil_frames):
+            content.append({"type": "text",  "text": f"Frame{i+1}: "})
+            content.append({"type": "image", "image": fr})
+            content.append({"type": "text",  "text": "\n"})
+        content.append({"type": "text", "text": prompt})
+        msgs = [{"role": "user", "content": content}]
         return self.processor.apply_chat_template(
             msgs, add_generation_prompt=False, tokenize=True,
             return_dict=True, return_tensors="pt").to(self._device)

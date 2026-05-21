@@ -172,11 +172,37 @@ python -m scripts.train_policy --steps 25000 --vae-ckpt so101_vae_revin.pt
 python -m scripts.eval_policy so101_strm.pt
 ```
 
-### One-shot overnight pipelines (Bridge V2 / OXE)
+### Clone-and-run: the 100M VAE-TRM pipeline (`run_pipeline.sh`)
 
-Two end-to-end scripts for unattended runs on another machine. They cap
-the vision cache at 350 episodes (~14 GB) to fit a 20 GB disk budget and
-chain everything under `set -e`:
+The single self-contained entry point — clone, install, run. It streams
+BridgeData V2 from HuggingFace (no manual download) and chains all three
+stages, each skipped if its output already exists (so it's resumable):
+
+```bash
+git clone <repo> && cd <repo>
+pip install -e .
+# Put the data on a FAST LOCAL DISK (NVMe/ext4) — training is disk-I/O-bound
+# on the vision cache; never use a network/FUSE mount.
+BABYGROOT_DATA=/mnt/nvme/babygroot ./run_pipeline.sh > pipeline.log 2>&1 &
+```
+
+1. **cache** InternVL3 features (download + visual/prompt augment + int8 cache),
+2. **VQ-VAE** action codebook on Bridge's 7-DoF actions,
+3. **VAE-TRM** policy — `STRMPolicyVAE` scaled to ~100M params in the TRM
+   (dim=1728, depth=2; the resampler stays at 768 via a thin `--vis-dim`
+   projection), fp16 AMP, atomic checkpoints, auto-resume.
+
+All paths are env-configurable (`BABYGROOT_DATA`, `N_EPS`, `N_VIS_AUG`,
+`VAE_STEPS`, …); stage 3 alone is `launch_strm_vae_bridge.sh`. If you already
+have a built cache, copy it to `$BABYGROOT_DATA/cache/oxe_vision_cache_v2` and
+stage 1 is skipped.
+
+### One-shot overnight pipelines (older recipes: CQ-VAE / VQ-VAE baselines)
+
+Two end-to-end scripts for the *baseline* policy (not the 100M VAE-TRM). They
+cap the vision cache at 350 episodes (~14 GB) to fit a 20 GB disk budget and
+chain everything under `set -e`. Note: these still hardcode a machine-local
+working dir — `run_pipeline.sh` above is the portable one.
 
 ```bash
 ./overnight.sh        > overnight.log 2>&1 &     # cache + CQ-VAE + policy

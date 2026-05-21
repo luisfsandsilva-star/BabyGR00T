@@ -318,9 +318,24 @@ def load_lerobot_episodes(dataset_id="IPEC-COMMUNITY/bridge_orig_lerobot",
         camera_key=camera_key,
     )
     eps = []
+    import time as _t
+    _t0 = _t.perf_counter()
+    target = streamer.n_episodes if streamer.n_episodes < 10**8 else None
     for ep in streamer.stream_episodes():
-        ac, sc, frames, _ = ep
-        eps.append((ac, sc, frames, prompt))
+        ac, sc, frames, ep_task_str = ep
+        # OXE LeRobot v2.0 datasets carry per-episode task descriptions in
+        # meta/tasks.jsonl (e.g. Bridge V2 has ~20k unique strings). Use them
+        # directly; fall back to the supplied default prompt only if missing.
+        ep_prompt = ep_task_str.strip() if (ep_task_str and ep_task_str.strip()) else prompt
+        eps.append((ac, sc, frames, ep_prompt))
+        n = len(eps)
+        if n % 25 == 0:
+            el = _t.perf_counter() - _t0
+            rate = n / max(el, 1e-6)
+            eta = (target - n) / rate if (target and rate > 0) else 0
+            print(f"  preload {n}{'/'+str(target) if target else ''} eps  "
+                  f"[{el:.0f}s, {rate:.1f} ep/s, ETA {eta:.0f}s]",
+                  flush=True)
     print(f"  TOTAL: {len(eps)} episodes, "
           f"{sum(e[0].shape[0] for e in eps)} chunks  ({dataset_id})")
     return eps

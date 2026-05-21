@@ -47,7 +47,8 @@ import psutil
 
 from babygroot_strm import (InternVL3Vision, load_so101_episodes,
                             load_lerobot_episodes, TASK_PROMPTS,
-                            visual_augment_chunk, build_paraphrase_pool)
+                            visual_augment_chunk, build_paraphrase_pool,
+                            build_task_paraphrase_pool)
 
 
 def _quantize_int8(stacked):
@@ -107,12 +108,21 @@ def main():
     print(f"  {len(episodes)} episodes, {total_chunks} chunks  "
           f"(variants per chunk: {n_variants})")
 
-    # ── Build the paraphrase pool from the static bank ──
+    # ── Build the paraphrase pool ──
+    # SO-101 uses the curated PARAPHRASE_BANK (hand-written for that task set).
+    # OXE / Bridge V2 has ~20k unique natural-language tasks; we use the
+    # programmatic template_paraphrases instead (no API, no SO-101 collapse).
     base_prompts = [task for (_, _, _, task) in episodes]
-    print(f"\nBuilding paraphrase pool over {len(set(base_prompts))} unique "
-          f"base prompts (static bank) ...")
-    paraphrase_pool = build_paraphrase_pool(base_prompts,
-                                             n=args.n_prompt_paraphrases)
+    if args.dataset == 'oxe':
+        print(f"\nBuilding paraphrase pool over {len(set(base_prompts))} unique "
+              f"per-episode task strings (programmatic templates) ...")
+        paraphrase_pool = build_task_paraphrase_pool(
+            base_prompts, n=args.n_prompt_paraphrases)
+    else:
+        print(f"\nBuilding paraphrase pool over {len(set(base_prompts))} unique "
+              f"base prompts (SO-101 static bank) ...")
+        paraphrase_pool = build_paraphrase_pool(
+            base_prompts, n=args.n_prompt_paraphrases)
     for bp, plist in list(paraphrase_pool.items())[:3]:
         print(f"  '{bp[:50]}' → {len(plist)} paraphrases  "
               f"(sample: {plist[0][:50]!r})")
@@ -130,15 +140,29 @@ def main():
         'prompts_per_variant': {},
     }
 
+    n_skipped = 0
     for ep_i, (action_chunks, _, per_chunk_frames, task) in enumerate(episodes):
         n_chunks = action_chunks.shape[0]
         pool = paraphrase_pool.get(task) or paraphrase_pool[next(iter(paraphrase_pool))]
 
         # Pick one prompt per variant for this episode (constant within a
         # variant, varies across variants — keeps the variant signal clean).
+        # Deterministic from ep_i so a resumed run reproduces the same prompts.
         rng = random.Random(0xC0FFEE + ep_i)
         variant_prompts = [rng.choice(pool) for _ in range(n_variants)]
         meta['prompts_per_variant'][str(ep_i)] = variant_prompts
+
+        out_path = os.path.join(args.cache_dir, f'ep_{ep_i:03d}.pt')
+        # ── Resume guard: skip this episode if its ep_NNN.pt already exists.
+        # The prompt entry above is still added to meta so the regenerated
+        # meta.json covers all episodes on a resumed run.
+        if os.path.exists(out_path):
+            n_skipped += 1
+            total_bytes += os.path.getsize(out_path)
+            if (ep_i + 1) % 100 == 0 or ep_i < 3:
+                print(f"  ep {ep_i:3d}/{len(episodes)}  SKIP (exists)  "
+                      f"skipped_so_far={n_skipped}", flush=True)
+            continue
 
         ep_cache: list = []  # length = n_chunks * n_variants
         # Variant 0 = original; variants 1..n_vis_aug = augmented
@@ -156,8 +180,10 @@ def main():
                 q, scale = _quantize_int8(stacked)
                 ep_cache.append((q, scale))
 
-        out_path = os.path.join(args.cache_dir, f'ep_{ep_i:03d}.pt')
-        torch.save(ep_cache, out_path)
+        # Atomic write so a kill mid-save can't corrupt the ep file.
+        tmp_path = out_path + '.tmp'
+        torch.save(ep_cache, tmp_path)
+        os.replace(tmp_path, out_path)
         size = os.path.getsize(out_path); total_bytes += size
         elapsed = time.perf_counter() - t0
         ram = psutil.virtual_memory().used / 1e9
@@ -167,9 +193,18 @@ def main():
               f"RAM={ram:.1f}GB  [{elapsed:.0f}s]", flush=True)
         if (ep_i + 1) % 5 == 0:
             gc.collect(); torch.cuda.empty_cache()
+        # Incremental meta.json save (every 100 eps) so a crash leaves a
+        # readable meta.json reflecting the completed episodes.
+        if (ep_i + 1) % 100 == 0:
+            with open(os.path.join(args.cache_dir, 'meta.json') + '.tmp', 'w') as f:
+                json.dump(meta, f, indent=2)
+            os.replace(os.path.join(args.cache_dir, 'meta.json') + '.tmp',
+                       os.path.join(args.cache_dir, 'meta.json'))
 
-    with open(os.path.join(args.cache_dir, 'meta.json'), 'w') as f:
+    with open(os.path.join(args.cache_dir, 'meta.json') + '.tmp', 'w') as f:
         json.dump(meta, f, indent=2)
+    os.replace(os.path.join(args.cache_dir, 'meta.json') + '.tmp',
+               os.path.join(args.cache_dir, 'meta.json'))
     print(f"\nDone. {total_chunks} chunks × {n_variants} variants cached in "
           f"{time.perf_counter()-t0:.0f}s, total {total_bytes/1e9:.1f} GB.")
 
