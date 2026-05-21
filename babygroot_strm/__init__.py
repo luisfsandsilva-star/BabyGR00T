@@ -5,7 +5,7 @@ from .vqvae import ActionVQVAE1d
 from .vision import (LayerAggregator, PerceiverResampler, ScaleNorm,
                      InternVL3Vision, NUM_RESAMPLER_LATENTS,
                      VIS_HIDDEN_DIM, NUM_FRAMES, TILE_SIZE)
-from .policy import STRMPolicy
+from .policy import STRMPolicy, STRMPolicyVAE
 from .optimizer import MuSGD_LARS
 from .data import (load_so101_episodes, load_lerobot_episodes,
                    SO101Streamer, ChunkDataset,
@@ -19,7 +19,7 @@ __all__ = [
     "VQ1d_EMA", "cosine_snce_tau", "SEQ_LENS_1D",
     "LayerAggregator", "PerceiverResampler", "ScaleNorm", "InternVL3Vision",
     "NUM_RESAMPLER_LATENTS", "VIS_HIDDEN_DIM", "NUM_FRAMES", "TILE_SIZE",
-    "STRMPolicy", "MuSGD_LARS",
+    "STRMPolicy", "STRMPolicyVAE", "MuSGD_LARS",
     "load_so101_episodes", "load_lerobot_episodes",
     "SO101Streamer", "ChunkDataset", "make_loader",
     "chunk_collate", "OUNoise", "load_vision_cache",

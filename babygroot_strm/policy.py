@@ -378,6 +378,151 @@ class STRMPolicy(nn.Module):
         return loss, per_level, all_logits
 
 
+# ════════════════════════════════════════════════════════════
+#  VAE-flavored variant — Gaussian belief latents (split state)
+# ════════════════════════════════════════════════════════════
+
+class STRMPolicyVAE(STRMPolicy):
+    """Same deterministic additive-decay TRM recurrence, but the latent state
+    is a **diagonal Gaussian belief**: the d-wide channel is split into
+    `[μ | ρ]`, μ the mean and ρ the **log-precision** (`ρ = log 1/σ²`). The
+    recurrence refines the full belief deterministically (μ and ρ accumulate
+    via the same `+a_t·g` rule, so the convergence/decay guarantees are
+    untouched). At **every supervision point** (each outer cycle) we draw a
+    fresh reparameterized sample from the current belief and decode it —
+    exactly the deterministic model's per-cycle readout, VAE-flavored.
+
+    Log-precision is the natural additive quantity (precision = information,
+    which accumulates as evidence arrives; variance shrinks, so it would be
+    backwards to accumulate). It also keeps everything division-free:
+
+        σ = exp(-ρ/2),   z̃ = μ + σ⊙ε
+        KL(N(μ,σ²)‖N(0,1)) = ½(exp(-ρ) + μ² - 1 + ρ)        (per dim)
+
+    The state width D is **split** (μ and ρ each D/2), so the sampled latent
+    and the head are D/2 — same total parameter budget as the deterministic
+    model (fair compute A/B). Init z=0 ⇒ μ=0, ρ=0 ⇒ belief N(0,1) = prior.
+
+    Loss is a per-cycle ELBO averaged over H:
+        (1/H) Σ_h [ masked_CE(head(z̃_h)) + β · KL(belief_h) ]
+    with free-bits on the KL (per-dim floor `free_bits` nats) to prevent
+    posterior collapse. At eval (`self.training=False`) we use the mean
+    (ε=0, MAP) for a deterministic probe.
+    """
+    def __init__(self, *args, beta=1e-3, free_bits=0.1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.latent_dim = self.dim // 2
+        self.beta = float(beta)
+        self.free_bits = float(free_bits)
+        # head reads the sampled latent (D/2), not the full belief state
+        self.out_head = nn.ModuleList([
+            nn.Linear(self.latent_dim, self.k) for _ in range(self.n_levels)
+        ])
+
+    def _sample_heads(self, z):
+        """Split z=[μ|ρ] on the channel dim, sample z̃=μ+exp(-ρ/2)⊙ε (mean at
+        eval), return per-level logits + the belief (μ, ρ) for the KL."""
+        mu      = z[..., :self.latent_dim]
+        logprec = z[..., self.latent_dim:]
+        std = torch.exp(-0.5 * logprec)
+        eps = torch.randn_like(std) if self.training else torch.zeros_like(std)
+        zt = mu + std * eps
+        offset = 0; logits = []
+        for l, T_l in enumerate(self.seq_lens):
+            logits.append(self.out_head[l](zt[:, offset:offset + T_l, :]))
+            offset += T_l
+        return logits, mu, logprec
+
+    def forward(self, indices_list, vis, state, mask_list=None,
+                n_outer=None, n_inner=None, return_beliefs=False):
+        B = vis.shape[0]
+        N = sum(self.seq_lens)
+        H = n_outer if n_outer is not None else self.H_outer
+        L = n_inner if n_inner is not None else self.L_inner
+        dev = vis.device
+        if mask_list is None:
+            mask_list = [torch.ones(B, T_l, dtype=torch.bool, device=dev)
+                         for T_l in self.seq_lens]
+        kv = self._build_kv(vis, state)
+        y = self._y_embed(B, dev, indices_list, mask_list)
+        rL, rH = self._rhos()
+        wL = self._weights(rL, L, dev, y.dtype)
+        wH = self._weights(rH, H, dev, y.dtype)
+        z_H = torch.zeros(B, N, self.dim, device=dev, dtype=y.dtype)
+        all_logits, all_mu, all_rho = [], [], []
+        for h in range(H):
+            if self.grad_checkpoint and self.training:
+                z_L = _ckpt(self._inner, z_H, y, kv, wL, use_reentrant=False)
+            else:
+                z_L = self._inner(z_H, y, kv, wL)
+            z_H = z_H + wH[h] * self.g(z_H + z_L + y, kv)   # deterministic belief
+            logits, mu, rho = self._sample_heads(z_H)        # sampled readout
+            all_logits.append(logits)
+            if return_beliefs:
+                all_mu.append(mu); all_rho.append(rho)
+        if return_beliefs:
+            return all_logits, all_mu, all_rho
+        return all_logits
+
+    def forward_loss(self, target_indices, vis, state, soft_targets=None,
+                     n_outer=None, n_inner=None, h_max=None,
+                     mask_ratio_max=1.0):
+        """Per-cycle ELBO: masked-CE on the sampled readout + β·KL(belief),
+        averaged over H. Returns (loss, per_level_diag, all_cycle_logits)."""
+        B = vis.shape[0]
+        dev = vis.device
+        masks = []
+        for l, T_l in enumerate(self.seq_lens):
+            lo = 1.0 / T_l
+            hi = max(lo, mask_ratio_max)
+            r = torch.rand(B, device=dev) * (hi - lo) + lo
+            noise = torch.rand(B, T_l, device=dev)
+            m = noise < r.unsqueeze(1)
+            m[torch.arange(B, device=dev), noise.argmin(1)] = True
+            masks.append(m)
+
+        n_outer_eff = (_random.randint(1, h_max) if h_max is not None else n_outer)
+        all_logits, all_mu, all_rho = self.forward(
+            target_indices, vis, state, mask_list=masks,
+            n_outer=n_outer_eff, n_inner=n_inner, return_beliefs=True)
+        H = len(all_logits)
+
+        total = 0.0
+        kl_total = 0.0
+        per_level = [{'mask_correct': 0, 'mask_total': 0, 'loss': 0.0}
+                     for _ in self.seq_lens]
+        for h_idx in range(H):
+            logits_list = all_logits[h_idx]
+            cycle_loss = 0.0
+            for l in range(self.n_levels):
+                target = target_indices[l]
+                m = masks[l]
+                lp = F.log_softmax(logits_list[l], dim=-1)
+                if soft_targets is not None:
+                    ce = -(soft_targets[l].to(lp.dtype) * lp).sum(-1)
+                else:
+                    ce = -lp.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+                n_m = m.float().sum(1).clamp(min=1)
+                loss_l = ((ce * m.float()).sum(1) / n_m).mean()
+                cycle_loss = cycle_loss + loss_l
+                if h_idx == H - 1:
+                    with torch.no_grad():
+                        preds = logits_list[l].argmax(-1)
+                        correct = (preds == target) & m
+                        per_level[l]['loss'] = loss_l.item()
+                        per_level[l]['mask_correct'] = int(correct.float().sum().item())
+                        per_level[l]['mask_total']   = int(m.float().sum().item())
+            total = total + cycle_loss / self.n_levels
+            # KL of this cycle's belief vs N(0,1), free-bits floor per dim.
+            mu, rho = all_mu[h_idx], all_rho[h_idx]
+            kl = 0.5 * (torch.exp(-rho) + mu * mu - 1.0 + rho)      # (B,N,latent)
+            kl = kl.clamp(min=self.free_bits).sum(-1).mean()        # per-token, free-bits
+            kl_total = kl_total + kl
+
+        loss = total / H + self.beta * (kl_total / H)
+        return loss, per_level, all_logits
+
+
 if __name__ == '__main__':
     import sys, time
     depth = int(sys.argv[1]) if len(sys.argv) > 1 else 2

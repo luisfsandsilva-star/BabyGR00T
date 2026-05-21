@@ -22,7 +22,7 @@ import torch
 
 from babygroot_strm import (RevIN, ActionRQUNet1d, ActionVQVAE1d, VQ1d_EMA,
                             LayerAggregator, PerceiverResampler,
-                            STRMPolicy,
+                            STRMPolicy, STRMPolicyVAE,
                             load_so101_episodes, load_lerobot_episodes,
                             make_loader,
                             NUM_RESAMPLER_LATENTS, VIS_HIDDEN_DIM, SEQ_LENS_1D)
@@ -50,8 +50,11 @@ def main():
     trained_dim   = c.get('dim',     768)
     rho_L = c.get('rho_L', 0.1); rho_H = c.get('rho_H', 0.1)
     state_dim = c.get('state_dim', c.get('action_dim', 6))
+    is_vae = c.get('vae_latent', False)
+    beta = c.get('beta', 1e-3); free_bits = c.get('free_bits', 0.1)
     print(f"  trained: depth={trained_depth} dim={trained_dim} L={trained_L} "
-          f"H={trained_H} ρ_L={rho_L} ρ_H={rho_H}  state_dim={state_dim}")
+          f"H={trained_H} ρ_L={rho_L} ρ_H={rho_H}  state_dim={state_dim}  "
+          f"vae_latent={is_vae}")
 
     print(f"Loading frozen VAE from {args.vae_ckpt} ...")
     vck = torch.load(args.vae_ckpt, map_location=device, weights_only=False)
@@ -70,12 +73,15 @@ def main():
     aggregator = LayerAggregator(hidden_dim=VIS_HIDDEN_DIM, n_layers=25).to(device)
     resampler  = PerceiverResampler(input_dim=VIS_HIDDEN_DIM, dim=trained_dim,
                                     num_latents=NUM_RESAMPLER_LATENTS).to(device)
-    policy = STRMPolicy(
+    PolicyCls = STRMPolicyVAE if is_vae else STRMPolicy
+    extra = dict(beta=beta, free_bits=free_bits) if is_vae else {}
+    policy = PolicyCls(
         seq_lens=seq_lens, k_codebook=K,
         dim=trained_dim, heads=8, depth=trained_depth,
         L_inner=trained_L, H_outer=trained_H,
         rho_L=rho_L, rho_H=rho_H,
         max_prefix=NUM_RESAMPLER_LATENTS + 16, state_dim=state_dim,
+        **extra,
     ).to(device)
     aggregator.load_state_dict(c['aggregator'])
     resampler.load_state_dict(c['resampler'])

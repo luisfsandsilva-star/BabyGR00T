@@ -30,7 +30,7 @@ import torch.nn.functional as F
 
 from babygroot_strm import (RevIN, ActionRQUNet1d, ActionVQVAE1d, VQ1d_EMA,
                             LayerAggregator, PerceiverResampler,
-                            STRMPolicy, MuSGD_LARS,
+                            STRMPolicy, STRMPolicyVAE, MuSGD_LARS,
                             load_so101_episodes, load_lerobot_episodes,
                             make_loader, cosine_snce_tau,
                             NUM_RESAMPLER_LATENTS, VIS_HIDDEN_DIM,
@@ -67,6 +67,15 @@ def main():
     ap.add_argument('--h-max',  type=int,   default=12,
                     help="Train with H ~ U{1..h_max} per call. Unlocks "
                          "test-time scaling beyond the training depth.")
+    # VAE-flavored latent (Gaussian belief state, split [μ|ρ], sampled readout)
+    ap.add_argument('--vae-latent', action='store_true',
+                    help="Use STRMPolicyVAE: split the latent into mean + "
+                         "log-precision, sample at each supervised cycle, add "
+                         "β·KL (free-bits). Same recurrence + param budget.")
+    ap.add_argument('--beta', type=float, default=1e-3,
+                    help="KL weight for --vae-latent.")
+    ap.add_argument('--free-bits', type=float, default=0.1,
+                    help="Per-dim KL floor (nats) for --vae-latent.")
     # Loss / curriculum
     ap.add_argument('--no-snce', action='store_true', default=True,
                     help="Use plain CE on hard targets. Default for v3.")
@@ -176,12 +185,15 @@ def main():
     aggregator = LayerAggregator(hidden_dim=VIS_HIDDEN_DIM, n_layers=25).to(device)
     resampler  = PerceiverResampler(input_dim=VIS_HIDDEN_DIM, dim=args.dim,
                                     num_latents=NUM_RESAMPLER_LATENTS).to(device)
-    policy = STRMPolicy(
+    PolicyCls = STRMPolicyVAE if args.vae_latent else STRMPolicy
+    extra = dict(beta=args.beta, free_bits=args.free_bits) if args.vae_latent else {}
+    policy = PolicyCls(
         seq_lens=seq_lens, k_codebook=K,
         dim=args.dim, heads=8, depth=args.depth,
         L_inner=args.L_inner, H_outer=args.H_outer,
         rho_L=args.rho_L, rho_H=args.rho_H,
         max_prefix=NUM_RESAMPLER_LATENTS + 16, state_dim=state_dim,
+        **extra,
     ).to(device)
 
     n_pol = sum(p.numel() for p in policy.parameters()) / 1e6
@@ -194,9 +206,11 @@ def main():
           if args.mask_curriculum else "uniform [1/T, 1.0]")
     print(f"  Aggregator: {n_agg:.2f}M  Resampler: {n_res:.2f}M  "
           f"Policy: {n_pol:.2f}M", flush=True)
+    vae_str = (f"  VAE-latent (split μ|ρ, β={args.beta}, free_bits={args.free_bits})"
+               if args.vae_latent else "")
     print(f"  TRM: depth={args.depth}  dim={args.dim}  L={args.L_inner}  "
           f"{h_str}  ρ_L0={args.rho_L} ρ_H0={args.rho_H} (learnable)  "
-          f"additive closed-form updates (a_t=ρ^(t/(n-1)))", flush=True)
+          f"additive closed-form updates (a_t=ρ^(t/(n-1))){vae_str}", flush=True)
     aux_str = ""
     if args.mse_decode_weight > 0:
         aux_str = (f" + β={args.mse_decode_weight}·MSE_decode("
@@ -292,6 +306,8 @@ def main():
             'L_inner': args.L_inner, 'H_outer': args.H_outer,
             'depth': args.depth, 'dim': args.dim,
             'rho_L': args.rho_L, 'rho_H': args.rho_H,
+            'vae_latent': args.vae_latent, 'beta': args.beta,
+            'free_bits': args.free_bits,
             'action_dim': action_dim, 'state_dim': state_dim,
             'dataset': args.dataset,
             'oxe_dataset_id': args.oxe_dataset_id if args.dataset == 'oxe' else None,
