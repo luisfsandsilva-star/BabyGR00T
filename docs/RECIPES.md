@@ -17,6 +17,11 @@ Named recipes ship with `scripts/train_policy.py`:
   codebook structure changes. The clean comparison answer to "does the
   CQ-VAE's hierarchical residual + skip-connection structure earn its
   cost?"
+- **vae-latent** *(experimental, under test)* — `STRMPolicyVAE`: the latent
+  state becomes a Gaussian belief (split `[μ | ρ]`, ρ = log-precision),
+  sampled at each supervised cycle, trained with a per-cycle ELBO
+  (`CE + β·KL`). Same recurrence + param budget; adds coherent multimodal
+  action sampling. See "Experimental variants" below.
 
 ---
 
@@ -211,3 +216,60 @@ test split — every probe number above is on training-set chunks (= upper
 bound on actual generalization). With Bridge V2 (~53k episodes) you can
 finally hold out 5–10 % of episodes and report an honest test number; do
 this before drawing conclusions about v3 vs v4 vs anything new on OXE.
+
+---
+
+## Experimental variants (under test)
+
+### vae-latent — Gaussian-belief latent (`STRMPolicyVAE`)
+
+Same deterministic additive closed-form-decay recurrence, but the latent
+state's `d`-wide channel is **split `[μ | ρ]`** (ρ = log-precision,
+information form). The belief is refined deterministically (μ and ρ both
+accumulate via `+a_t·g`, so all convergence/decay guarantees are untouched);
+at **every supervised outer cycle** a fresh reparameterized sample
+`z̃ = μ + e^{-ρ/2}⊙ε` is decoded — the deterministic model's per-cycle
+readout, VAE-flavored. Loss is a per-cycle ELBO averaged over H:
+`CE(sample) + β·KL(belief)` with a free-bits floor; division-free
+`KL = ½(e^{-ρ}+μ²-1+ρ)`. Splitting the width keeps the parameter budget
+(~2.39 M vs 2.44 M), so it's a fair compute A/B. Eval uses the mean
+(`ε=0`, MAP) for a deterministic probe; sample at inference for coherent
+multimodal action draws.
+
+```bash
+python -m scripts.train_policy \
+  --steps 25000 \
+  --depth 2 --dim 768 --L-inner 5 --H-outer 4 --h-max 12 \
+  --rho-L 0.1 --rho-H 0.1 \
+  --vae-latent --beta 1e-3 --free-bits 0.1 \
+  --no-snce --tau-anneal-frac 0.4 \
+  --mask-curriculum --mask-curriculum-init 0.3 --mask-curriculum-frac 0.5 \
+  --ckpt-path so101_strm_vae.pt
+```
+
+**Why**: a global stochastic latent gives *coherent* multimodal action
+sampling (one consistent mode per draw), beyond the per-token categorical
+head — the payoff that matters at data scale. Log-precision is the natural
+additive quantity (precision = information, which accumulates as evidence
+arrives).
+
+**Preliminary (78-ep SO-101, matched recipe + compute — both data-capped):**
+
+| probe @ step | vae-latent | deterministic TRM |
+|---:|---:|---:|
+| 500  | 9.9 % | 9.6 % |
+| 1000 | 9.3 % | 8.8 % |
+| 1500 | **10.4 %** | 9.1 % |
+| best | **10.4 %** (@1500) | 10.0 % (@2000) |
+
+The VAE variant tracks slightly *ahead* of the deterministic TRM at every
+matched probe and hit a higher best in fewer steps, at ~0.3 higher loss (the
+KL + sampling terms — no accuracy cost). **Caveat**: the probe is a 64-sample
+estimate, both models sit near the ~10 % memorization ceiling of 78
+episodes, and S-TRM v3 (12.4 % at 25 k steps) remains the high-water mark.
+So this is *suggestive, not conclusive* — the decisive comparison is on
+Bridge V2, where there is headroom and real multimodality to model.
+
+**Status**: implemented (`--vae-latent`), wired through train/eval, smoke-
+and short-run-tested on SO-101. Pending: the Bridge A/B
+(deterministic-TRM vs vae-latent, × CQ-VAE vs VQ-VAE codebook).
