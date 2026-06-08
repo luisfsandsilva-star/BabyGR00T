@@ -295,8 +295,11 @@ class STRMPolicy(nn.Module):
                  n_embodiments=1, per_emb_head=False,
                  g_input_noise=0.0, layerscale_init=0.1, one_step_grad=False,
                  output_scalenorm=False, carry_zl=False, nesterov=False, nesterov_beta=0.7,
-                 inner_tol=0.0):
+                 inner_tol=0.0, g_scalenorm=False):
         super().__init__()
+        # g_scalenorm: ScaleNorm on g's OUTPUT inside the recurrence (in _g_noisy) — bounds the
+        #   iterated latent so ‖z‖ can't run away (fixes carry_zl magnitude drift). Distinct from
+        #   output_scalenorm (readout-only). Built below after dim is known.
         # inner_tol: relative fixed-point residual at which the no_grad inner warmup early-stops
         #   (0 = run all L steps). Speeds up carry_zl warm-started cycles with no value change.
         self.inner_tol = float(inner_tol)
@@ -403,6 +406,10 @@ class STRMPolicy(nn.Module):
         # readout. Re-adding it bounds what the head sees (projects z to a learnable-radius sphere)
         # — at the cost of discarding magnitude (watch val acc/loss for expressiveness loss).
         self.out_norm = ScaleNorm(dim) if output_scalenorm else None
+        # Hard bound on g's output inside the recurrence: per-token unit-L2 normalize (NO learnable scale,
+        # NO √dim/RMS rescale). Caps ‖g‖=1 so ‖z*‖ can't run away from carry_zl. A learnable ScaleNorm
+        # here FAILED (model grows its radius → ‖z*‖ inflated to 265 and the fixed point broke).
+        self.g_scalenorm = bool(g_scalenorm)
 
     # ── Helpers ──
 
@@ -516,7 +523,10 @@ class STRMPolicy(nn.Module):
         if self.training and self.g_input_noise > 0:
             z = z + torch.randn_like(z) * self.g_input_noise
             ctx = ctx + torch.randn_like(ctx) * self.g_input_noise
-        return self.g(z, ctx, kv)
+        out = self.g(z, ctx, kv)
+        # Unit-L2 normalize g's OUTPUT every cycle — hard-bounds the iterated latent at the source
+        # (‖g‖=1 per token) so ‖z‖ can't accumulate. (output_scalenorm only bounds the readout copy.)
+        return F.normalize(out, dim=-1) if self.g_scalenorm else out
 
     def _inner(self, z_H, y, kv, wL, z_L_init=None, n_steps=None):
         """Inner loop. Three modes:

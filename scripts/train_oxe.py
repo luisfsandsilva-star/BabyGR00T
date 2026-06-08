@@ -95,6 +95,9 @@ def main():
                     help="Inner no_grad warmup early-stops at this rel. fixed-point residual (0=off).")
     ap.add_argument('--compile', action='store_true',         # torch.compile the g-net (~2-3×)
                     help="torch.compile the policy's shared net g.")
+    ap.add_argument('--g-scalenorm', action='store_true',     # ScaleNorm on g's output (bounds ‖z‖ runaway)
+                    help="ScaleNorm on g's output inside the recurrence — bounds the iterated latent "
+                         "so carry_zl can't inflate ‖z‖ (fixes the magnitude drift).")
     ap.add_argument('--cnn-dims', type=int, nargs='+', default=[24, 48, 96, 192])
     ap.add_argument('--cnn-depths', type=int, nargs='+', default=[1, 1, 1, 1])
     ap.add_argument('--cnn-expand', type=int, default=2)
@@ -590,7 +593,8 @@ def main():
                          one_step_grad=args.one_step_grad,
                          output_scalenorm=args.output_scalenorm,
                          carry_zl=args.carry_zl, nesterov=args.nesterov,
-                         nesterov_beta=args.nesterov_beta, inner_tol=args.inner_tol)
+                         nesterov_beta=args.nesterov_beta, inner_tol=args.inner_tol,
+                         g_scalenorm=args.g_scalenorm)
     if args.no_vae:
         policy = STRMPolicy(**policy_common).to(dev)
         print(f"  STRMPolicy (no-VAE); update={args.update_mode}; α-param={args.alpha_parametrization}; "
