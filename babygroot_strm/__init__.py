@@ -12,7 +12,8 @@ from .data import (load_so101_episodes, load_lerobot_episodes,
                    make_loader, chunk_collate, OUNoise,
                    load_vision_cache, TASK_PROMPTS, SUPPLEMENT_PROMPTS)
 from .augment import (visual_augment_chunk, sample_paraphrases,
-                      build_paraphrase_pool, PARAPHRASE_BANK)
+                      build_paraphrase_pool, build_task_paraphrase_pool,
+                      template_paraphrases, PARAPHRASE_BANK)
 
 __all__ = [
     "RevIN", "ActionRQUNet1d", "ActionVQVAE1d",
@@ -25,5 +26,6 @@ __all__ = [
     "chunk_collate", "OUNoise", "load_vision_cache",
     "TASK_PROMPTS", "SUPPLEMENT_PROMPTS",
     "visual_augment_chunk", "sample_paraphrases",
-    "build_paraphrase_pool", "PARAPHRASE_BANK",
+    "build_paraphrase_pool", "build_task_paraphrase_pool",
+    "template_paraphrases", "PARAPHRASE_BANK",
 ]

@@ -70,7 +70,8 @@ class SO101Streamer:
     def __init__(self, dataset_id="pavelsimo/SO-101-pick-and-place",
                  n_episodes=200, chunk_len=CHUNK_LEN,
                  local_data_dir=DEFAULT_DATA_DIR, load_video=False,
-                 camera_key="observation.images.front"):
+                 camera_key="observation.images.front",
+                 episode_indices=None):
         from datasets import load_dataset
         from huggingface_hub import hf_hub_download
         self.chunk_len = chunk_len
@@ -80,7 +81,11 @@ class SO101Streamer:
         self.camera_key = camera_key
         if os.path.isdir(local_data_dir):
             print(f"Loading from local: {local_data_dir} ...")
-            self.ds = load_dataset(local_data_dir, split='train')
+            # parquet-only load — avoids auto-detecting the Video feature (which would
+            # require torchcodec just to iterate); we decode videos ourselves via PyAV.
+            import glob as _glob
+            data_files = _glob.glob(os.path.join(local_data_dir, 'data/**/*.parquet'), recursive=True)
+            self.ds = load_dataset('parquet', data_files=sorted(data_files), split='train')
             info_path = os.path.join(local_data_dir, 'meta/info.json')
             tasks_path = os.path.join(local_data_dir, 'meta/tasks.jsonl')
             tasks_path = tasks_path if os.path.exists(tasks_path) else None
@@ -97,6 +102,7 @@ class SO101Streamer:
         self.video_path_template = self.info['video_path']
         self.chunks_size = self.info['chunks_size']
         self.n_episodes = n_episodes
+        self.episode_indices = set(episode_indices) if episode_indices is not None else None
         # Task lookup (LeRobot v2.0+ datasets ship meta/tasks.jsonl mapping
         # task_index -> human-readable task). BridgeData V2 has 20k unique
         # tasks; without this map we'd lose the language signal entirely.
@@ -166,6 +172,8 @@ class SO101Streamer:
         yielded = 0
         for sample in it:
             ep = sample['episode_index']
+            if self.episode_indices is not None and ep not in self.episode_indices:
+                continue                                          # skip unwanted episodes
             if ep != current_ep:
                 if current_ep >= 0 and len(ep_actions) >= self.chunk_len:
                     yield self._package(current_ep, ep_actions, ep_states, ep_task_idx)
@@ -278,7 +286,8 @@ def load_lerobot_episodes(dataset_id="IPEC-COMMUNITY/bridge_orig_lerobot",
                           camera_key="observation.images.image_0",
                           local_data_dir=None,
                           n_episodes=None,
-                          prompt=None):
+                          prompt=None,
+                          episode_indices=None):
     """Load a single LeRobot dataset (e.g. an OXE subset).
 
     Returns the same tuple format as `load_so101_episodes`:
@@ -316,6 +325,7 @@ def load_lerobot_episodes(dataset_id="IPEC-COMMUNITY/bridge_orig_lerobot",
         local_data_dir=local_data_dir,
         load_video=load_video,
         camera_key=camera_key,
+        episode_indices=episode_indices,
     )
     eps = []
     import time as _t

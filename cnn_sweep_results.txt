@@ -1,0 +1,7 @@
+variant          | final_loss | train_acc | steps     | verdict
+v0_baseline      | 0.217      | acc=99.3% | 1200      | LEARNS✓
+v1_expand4       | 0.243      | acc=98.8% | 1200      | LEARNS✓
+v2_layernorm     | 0.257      | acc=98.9% | 1200      | LEARNS✓
+v3_pe            | 0.174      | acc=99.9% | 1200      | LEARNS✓
+v4_scaled        | 0.237      | acc=98.7% | 1200      | LEARNS✓
+v5_kitchen_sink  | 0.160      | acc=99.8% | 1200      | LEARNS✓

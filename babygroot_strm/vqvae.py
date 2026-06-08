@@ -63,12 +63,23 @@ class ActionVQVAE1d(nn.Module):
     cross-level information shortcuts.
     """
     def __init__(self, action_dim=ACTION_DIM, d=D, k=K, beta=BETA,
-                 vq_cls=VQ1d_EMA, chunk_len=CHUNK_LEN):
+                 vq_cls=VQ1d_EMA, chunk_len=CHUNK_LEN, dropout=0.0,
+                 binary_last=False, dead_threshold=5):
         super().__init__()
         self.action_dim = action_dim
         self.d = d
         self.chunk_len = chunk_len
         self.bottleneck_T = chunk_len // 4    # 4 tokens for default chunk_len=16
+        # binary_last: treat the last action dim (gripper) as a Bernoulli variable —
+        # the decoder's last output channel is a LOGIT, trained with BCE and read out
+        # via sigmoid (see recon_to_actions). Encoder input + codes are unchanged
+        # (gripper stays precision-normalized on the way in), so the policy's
+        # encode/target path is identical; only the decode→action readout differs.
+        self.binary_last = bool(binary_last)
+        # [lo, hi] original gripper range, set at train time; maps sigmoid prob → action units.
+        # Registered ONLY when binary_last, so non-binary (legacy) ckpts still load strictly.
+        if self.binary_last:
+            self.register_buffer('gripper_range', torch.tensor([0.0, 1.0]))
 
         # Encoder — bit-for-bit identical to CQ-VAE up to vq3
         self.stem   = conv_same_1d(action_dim, d)
@@ -76,13 +87,24 @@ class ActionVQVAE1d(nn.Module):
         self.f2     = ResBlock1d(d * 2); self.proj23 = conv_down_1d(d * 2, d * 4)
         self.f3     = ResBlock1d(d * 4)
 
-        # Single bottleneck VQ — same shape as CQ-VAE's vq3
-        self.vq     = vq_cls(k, d * 4, beta=beta)
+        # Single bottleneck VQ — same shape as CQ-VAE's vq3. Pass dead_threshold
+        # through to VQ1d_EMA (codebook revival cadence); FSQ1d ignores it.
+        try:
+            self.vq = vq_cls(k, d * 4, beta=beta, dead_threshold=dead_threshold)
+        except TypeError:
+            self.vq = vq_cls(k, d * 4, beta=beta)
 
         # Decoder — no encoder skips
         self.up2    = _UpBlockNoSkip1d(d * 4, d * 2)
         self.up1    = _UpBlockNoSkip1d(d * 2, d)
         self.out    = nn.Conv1d(d, action_dim, 1)
+
+        # Dropout1d after each major stage (encoder + decoder). Dropout1d zeros entire
+        # channels per-sample, which is more impactful for convs than per-element Dropout.
+        # Zero parameters so doesn't break loading of existing dropout=0 ckpts.
+        # Acts on activations between stages — forces the network to develop redundant
+        # representations rather than memorizing per-sample features.
+        self.drop = nn.Dropout1d(dropout) if dropout > 0 else nn.Identity()
 
     # ── Uniform API for the policy + eval (mirrors ActionRQUNet1d) ──
     @property
@@ -100,11 +122,11 @@ class ActionVQVAE1d(nn.Module):
     # ── Encode / decode ──
     def _encode_to_bottleneck(self, x):
         h = self.stem(x)
-        h = self.f1(h)
+        h = self.drop(self.f1(h))                          # dropout after stage 1
         h = self.proj12(h)
-        h = self.f2(h)
+        h = self.drop(self.f2(h))                          # dropout after stage 2
         h = self.proj23(h)
-        h = self.f3(h)
+        h = self.drop(self.f3(h))                          # dropout after stage 3 (pre-VQ)
         return h
 
     def encode(self, x):
@@ -118,8 +140,8 @@ class ActionVQVAE1d(nn.Module):
     def decode(self, embs):
         """embs: list of one tensor (B, d*4, bottleneck_T)."""
         h = embs[0]
-        h = self.up2(h)
-        h = self.up1(h)
+        h = self.drop(self.up2(h))                         # dropout in decoder too
+        h = self.drop(self.up1(h))
         return self.out(h)
 
     def forward(self, x):
@@ -147,3 +169,16 @@ class ActionVQVAE1d(nn.Module):
         B, T = idx.shape
         emb = self.vq.emb(idx).view(B, T, self.vq.D).permute(0, 2, 1)
         return self.decode([emb])
+
+    def recon_to_actions(self, recon, m, lam):
+        """Convert raw decoder output → action units. recon: (B, A, T).
+        m, lam: (B, 1, A) per-chunk precision-norm stats. Continuous dims are
+        de-normalized; if binary_last, the last channel is a logit → sigmoid →
+        mapped to the stored [lo, hi] gripper range. Returns (B, T, A)."""
+        recon_t = recon.transpose(1, 2)                          # (B, T, A)
+        act = recon_t / lam.sqrt() + m
+        if self.binary_last:
+            lo, hi = self.gripper_range[0], self.gripper_range[1]
+            act = act.clone()
+            act[..., -1] = lo + (hi - lo) * torch.sigmoid(recon_t[..., -1])
+        return act

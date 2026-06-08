@@ -11,13 +11,14 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     "torch>=2.2",
+    "torchvision>=0.17",          # required by InternVL3's image/video processor (not optional)
     "numpy>=1.24",
     "Pillow>=10.0",
     "av>=11.0",
     "psutil>=5.9",
     "datasets>=2.16",
     "huggingface_hub>=0.20",
-    "transformers>=4.40",
+    "transformers>=4.52,<5",      # InternVL3-hf needs >=4.52; 5.x breaks AutoProcessor (video_processing_auto)
     "bitsandbytes>=0.43",
     "accelerate>=0.30",
 ]
