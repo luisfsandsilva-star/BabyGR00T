@@ -32,6 +32,14 @@ if [ -f "$POL_CKPT" ]; then
     echo "  (found existing ckpt — will resume: $POL_CKPT)"
 fi
 
+REVIVE_ARG=""
+if [ -n "${POL_REVIVE:-}" ]; then
+    REVIVE_ARG="--revive --revive-thresh ${REVIVE_THRESH:-0.02} \
+--revive-patience ${REVIVE_PATIENCE:-200} --revive-to ${REVIVE_TO:-0.1} \
+--revive-cooldown ${REVIVE_COOLDOWN:-400} --revive-decay ${REVIVE_DECAY:-1.0}"
+    echo "  (ρ revival ON: thresh=${REVIVE_THRESH:-0.02} patience=${REVIVE_PATIENCE:-200} to=${REVIVE_TO:-0.1} cooldown=${REVIVE_COOLDOWN:-400} decay=${REVIVE_DECAY:-1.0})"
+fi
+
 echo "=== VAE-TRM 100M on Bridge: dim=1728 depth=2 vis_dim=768, vae-latent, fp16 ==="
 echo "=== START: $(date) ==="
 echo "  VAE:   $VAE_CKPT"
@@ -46,11 +54,13 @@ python -u -m scripts.train_policy \
     --amp-dtype fp16 \
     --dim 1728 --vis-dim 768 --depth 2 \
     --L-inner 5 --H-outer 4 --h-max 12 \
-    --steps 20000 \
-    --batch-size 3 --grad-accum 3 --num-workers 0 --lru-size 16 \
+    --steps "${POL_STEPS:-20000}" \
+    --batch-size "${POL_BATCH:-3}" --grad-accum "${POL_ACCUM:-3}" \
+    --num-workers "${POL_WORKERS:-0}" --lru-size "${POL_LRU:-16}" \
     --lr 9.5e-4 \
     --n-probe 24 \
     $RESUME_ARG \
+    $REVIVE_ARG \
     --vae-ckpt   "$VAE_CKPT" \
     --cache-dir  "$CACHE_DIR" \
     --ckpt-path  "$POL_CKPT" \

@@ -13,7 +13,7 @@ mse_vae    = gt_decoded   vs raw GT             (VAE reconstruction floor)
 Usage:
   python -m scripts.eval_policy [ckpt_path] [n_samples]
 """
-import os, sys, time, random, argparse
+import os, sys, time, math, random, argparse
 
 THIS = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(THIS))
@@ -38,6 +38,16 @@ def main():
     ap.add_argument('n_samples', nargs='?', type=int, default=64)
     ap.add_argument('--vae-ckpt', default='so101_vae_revin.pt')
     ap.add_argument('--cache-dir', default='vision_cache')
+    ap.add_argument('--diagnostics', action='store_true',
+                    help="Print interpretability diagnostics at the trained "
+                         "(L,H): majority-class baseline + lift, codebook usage "
+                         "& entropy (GT vs predicted), prediction confidence, and "
+                         "per-action-dimension MSE vs the VAE-recon floor.")
+    ap.add_argument('--rho-h-sweep', type=str, default='',
+                    help="Space-separated ρ_H values to sweep, e.g. "
+                         "\"0.1 0.2 0.4 0.6\". Each is forced (override the "
+                         "trained/collapsed ρ_H) and the full H_GRID is run. "
+                         "Empty = use the checkpoint's trained ρ_H.")
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -48,6 +58,7 @@ def main():
     trained_H     = c.get('H_outer', 4)
     trained_depth = c.get('depth',   2)
     trained_dim   = c.get('dim',     768)
+    trained_vis_dim = c.get('vis_dim', trained_dim)  # resampler width; <dim => vis_proj up
     rho_L = c.get('rho_L', 0.1); rho_H = c.get('rho_H', 0.1)
     state_dim = c.get('state_dim', c.get('action_dim', 6))
     is_vae = c.get('vae_latent', False)
@@ -71,8 +82,12 @@ def main():
     print(f"  VAE: kind={vae_kind}  levels={seq_lens}  K={K}")
 
     aggregator = LayerAggregator(hidden_dim=VIS_HIDDEN_DIM, n_layers=25).to(device)
-    resampler  = PerceiverResampler(input_dim=VIS_HIDDEN_DIM, dim=trained_dim,
+    resampler  = PerceiverResampler(input_dim=VIS_HIDDEN_DIM, dim=trained_vis_dim,
                                     num_latents=NUM_RESAMPLER_LATENTS).to(device)
+    # Match train_policy: thin Linear(vis_dim -> dim) when the resampler is
+    # narrower than the TRM (the 100M Bridge config); Identity otherwise.
+    vis_proj = (torch.nn.Identity() if trained_vis_dim == trained_dim
+                else torch.nn.Linear(trained_vis_dim, trained_dim)).to(device)
     PolicyCls = STRMPolicyVAE if is_vae else STRMPolicy
     extra = dict(beta=beta, free_bits=free_bits) if is_vae else {}
     policy = PolicyCls(
@@ -85,8 +100,11 @@ def main():
     ).to(device)
     aggregator.load_state_dict(c['aggregator'])
     resampler.load_state_dict(c['resampler'])
+    if c.get('vis_proj') is not None and not isinstance(vis_proj, torch.nn.Identity):
+        vis_proj.load_state_dict(c['vis_proj'])
     policy.load_state_dict(c['policy'])
-    policy.eval(); aggregator.eval(); resampler.eval()
+    policy.eval(); aggregator.eval(); resampler.eval(); vis_proj.eval()
+    trained_rhoH_raw = policy.rho_H_raw.data.clone()  # learned value (for restore after a sweep)
     print(f"  step={c.get('step', '?')}  best_acc={c.get('best_acc', 0)*100:.1f}%")
 
     # Pick the right episode loader from the ckpt's dataset tag. Cap to the
@@ -114,7 +132,7 @@ def main():
 
     def vis_pipeline(hidden):
         layers = [hidden[:, l] for l in range(hidden.shape[1])]
-        return resampler(aggregator(layers))
+        return vis_proj(resampler(aggregator(layers)))
 
     def decode_action(idxs):
         """idxs: list of (B, T_l) per level, coarsest-first."""
@@ -178,39 +196,108 @@ def main():
                 'mse_full':   mse_full / n_chunks,
                 'mse_vae':    mse_vae / n_chunks}
 
-    print(f"\nH-scaling eval on {N} samples (L fixed at trained={trained_L})\n")
     n_lvls = len(seq_lens)
-    header_cells = "  ".join(f"{'L%d top1/5/10' % l:>16}" for l in range(n_lvls))
-    bar_w = max(92, 36 + n_lvls * 18)
-    print("=" * bar_w)
-    print(f"  {'H':>3}  {'time':>5}   {header_cells}  "
-          f"{'mse_pol':>8}  {'mse_full':>8}")
-    print("-" * bar_w)
 
-    results = []
-    for H in H_GRID:
-        t0 = time.perf_counter()
-        r = eval_at(trained_L, H)
-        elapsed = time.perf_counter() - t0
-        cells = ["/".join(f"{r['topk'][l][k]*100:.0f}" for k in TOPK)
-                 for l in range(n_lvls)]
-        cell_str = "  ".join(f"{c:>16}" for c in cells)
-        marker = "  ←train" if H == trained_H else ""
-        print(f"  {H:>3}  {elapsed:>5.1f}s   {cell_str}  "
-              f"{r['mse_policy']:>8.4f}  {r['mse_full']:>8.4f}{marker}")
-        results.append((H, r))
+    def run_h_grid(tag):
+        """Run the H_GRID sweep at the policy's current ρ_H; return list of (H, r)."""
+        header_cells = "  ".join(f"{'L%d top1/5/10' % l:>16}" for l in range(n_lvls))
+        bar_w = max(92, 36 + n_lvls * 18)
+        rho_l_now = float(torch.sigmoid(policy.rho_L_raw))
+        rho_h_now = float(torch.sigmoid(policy.rho_H_raw))
+        print("=" * bar_w)
+        print(f"  [{tag}]  ρ_L={rho_l_now:.4f}  ρ_H={rho_h_now:.4f}")
+        print(f"  {'H':>3}  {'time':>5}   {header_cells}  "
+              f"{'mse_pol':>8}  {'mse_full':>8}  {'top1mean':>8}")
+        print("-" * bar_w)
+        res = []
+        for H in H_GRID:
+            t0 = time.perf_counter()
+            r = eval_at(trained_L, H)
+            elapsed = time.perf_counter() - t0
+            cells = ["/".join(f"{r['topk'][l][k]*100:.0f}" for k in TOPK)
+                     for l in range(n_lvls)]
+            cell_str = "  ".join(f"{c:>16}" for c in cells)
+            t1mean = sum(r['topk'][l][1] for l in range(n_lvls)) / n_lvls * 100
+            marker = "  ←train" if H == trained_H else ""
+            print(f"  {H:>3}  {elapsed:>5.1f}s   {cell_str}  "
+                  f"{r['mse_policy']:>8.4f}  {r['mse_full']:>8.4f}  {t1mean:>7.1f}%{marker}")
+            res.append((H, r))
+        return res
 
-    print("=" * 92)
-    print(f"\n  VAE recon MSE (gt_decoded vs raw gt_action): "
-          f"{results[0][1]['mse_vae']:.4f}  (lower bound for mse_full)")
-    best = min(results, key=lambda x: x[1]['mse_policy'])
-    H, r = best
-    print(f"\n  Best by mse_policy: H={H}, mse_pol={r['mse_policy']:.4f}, "
-          f"mse_full={r['mse_full']:.4f}")
-    n_lvls = len(seq_lens)
-    print(f"     top-1 mean: {sum(r['topk'][l][1] for l in range(n_lvls))/n_lvls*100:.1f}%   "
-          f"top-5 mean: {sum(r['topk'][l][5] for l in range(n_lvls))/n_lvls*100:.1f}%   "
-          f"top-10 mean: {sum(r['topk'][l][10] for l in range(n_lvls))/n_lvls*100:.1f}%")
+    print(f"\nH-scaling eval on {N} samples (L fixed at trained={trained_L})")
+
+    # Parse the ρ_H sweep. Empty -> single run at the trained (collapsed) ρ_H.
+    sweep = [float(v) for v in args.rho_h_sweep.split()] if args.rho_h_sweep.strip() else []
+    if not sweep:
+        run_h_grid("trained ρ_H")
+    else:
+        print("DIAGNOSTIC: forcing ρ_H to test whether the outer loop is "
+              "pathologically collapsed (forcing it up should help) or genuinely "
+              "redundant (forcing it up should not help / hurt).\n")
+        # First the as-trained baseline, then each forced value.
+        run_h_grid("trained ρ_H (baseline)")
+        for v in sweep:
+            vv = min(max(v, 1e-4), 1 - 1e-4)
+            policy.rho_H_raw.data.fill_(float(torch.logit(torch.tensor(vv))))
+            run_h_grid(f"forced ρ_H={vv:g}")
+
+    if args.diagnostics:
+        import torch.nn.functional as F
+        # Restore the LEARNED ρ_H (a sweep above may have changed it).
+        policy.rho_H_raw.data.copy_(trained_rhoH_raw)
+        lnK = math.log(K)
+        print("\n" + "=" * 70)
+        print(f"  DIAGNOSTICS @ trained L={trained_L} H={trained_H}  "
+              f"ρ_L={float(torch.sigmoid(policy.rho_L_raw)):.3f} "
+              f"ρ_H={float(torch.sigmoid(policy.rho_H_raw)):.3f}   (N={N} samples)")
+        print(f"  refs: random top-1 = {100.0/K:.2f}%   max code-entropy = ln({K}) = {lnK:.3f} nats")
+        print("=" * 70)
+        gt_codes = {l: [] for l in range(n_lvls)}
+        pred_codes = {l: [] for l in range(n_lvls)}
+        ent_sum = [0.0] * n_lvls; ent_n = [0] * n_lvls
+        a_pred_all, a_gt_all, a_vae_all = [], [], []
+        with torch.no_grad():
+            for s in cached:
+                final = policy(None, s['vis'], s['state'], mask_list=None,
+                               n_outer=trained_H, n_inner=trained_L)[-1]
+                pred_idx = []
+                for l in range(n_lvls):
+                    lg = final[l][..., :K]                      # (1,T_l,K)
+                    p = lg.argmax(-1); pred_idx.append(p)
+                    gt_codes[l].append(s['gt'][l].flatten())
+                    pred_codes[l].append(p.flatten())
+                    pr = F.softmax(lg.float(), -1)
+                    ent_sum[l] += -(pr * pr.clamp_min(1e-9).log()).sum(-1).sum().item()
+                    ent_n[l] += pr[..., 0].numel()
+                a_pred_all.append(decode_action(pred_idx))
+                a_gt_all.append(s['action_norm']); a_vae_all.append(s['gt_recon'])
+        for l in range(n_lvls):
+            gt = torch.cat(gt_codes[l]); pr = torch.cat(pred_codes[l])
+            acc = (gt == pr).float().mean().item()
+            gtc = torch.bincount(gt, minlength=K).float()
+            maj_acc = (gtc.max() / gtc.sum()).item()
+            gtp = gtc / gtc.sum(); gt_ent = -(gtp[gtp > 0] * gtp[gtp > 0].log()).sum().item()
+            prc = torch.bincount(pr, minlength=K).float()
+            prp = prc / prc.sum(); pr_ent = -(prp[prp > 0] * prp[prp > 0].log()).sum().item()
+            conf = ent_sum[l] / max(ent_n[l], 1)
+            print(f"  level {l} (T={seq_lens[l]}):")
+            print(f"     top-1 {acc*100:5.1f}%   majority-class {maj_acc*100:5.1f}%   "
+                  f"lift {acc/max(maj_acc,1e-9):4.2f}x")
+            print(f"     codes used  GT {int((gtc>0).sum())}/{K} (H={gt_ent:.2f})   "
+                  f"PRED {int((prc>0).sum())}/{K} (H={pr_ent:.2f})  of ln{K}={lnK:.2f}")
+            print(f"     pred confidence: mean softmax entropy {conf:.2f} nats "
+                  f"({conf/lnK*100:.0f}% of max — lower=more confident)")
+        a_pred = torch.cat(a_pred_all); a_gt = torch.cat(a_gt_all); a_vae = torch.cat(a_vae_all)
+        A = a_gt.shape[-1]
+        pol = ((a_pred - a_gt) ** 2).mean(dim=(0, 1))
+        flo = ((a_vae - a_gt) ** 2).mean(dim=(0, 1))
+        names = ['x', 'y', 'z', 'roll', 'pitch', 'yaw', 'grip']
+        print(f"  per-action-dim MSE (RevIN-normalized space) — policy vs VAE-recon floor:")
+        for d in range(A):
+            nm = names[d] if d < len(names) else str(d)
+            print(f"     dim {d} {nm:>5}: policy {pol[d]:.4f}   floor {flo[d]:.4f}   "
+                  f"gap {pol[d]-flo[d]:+.4f}")
+        print(f"  overall: policy MSE {pol.mean():.4f}   VAE floor {flo.mean():.4f}")
 
 
 if __name__ == '__main__':

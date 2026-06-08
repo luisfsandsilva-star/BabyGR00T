@@ -18,7 +18,43 @@ from __future__ import annotations
 import random
 from typing import List, Sequence
 
+import torch
 from PIL import Image, ImageFilter, ImageEnhance
+
+
+# ════════════════════════════════════════════════════════════
+#  APR — Amplitude-Phase Recombination (Chen et al., ICCV 2021)
+#  arxiv 2108.08487. Texture/style RANDOMIZER (not a transfer).
+# ════════════════════════════════════════════════════════════
+
+def apr_augment(frames: "torch.Tensor", p: float = 0.5, eta_max: float = 1.0) -> "torch.Tensor":
+    """Randomize each image's FFT AMPLITUDE (texture/style) while keeping its
+    PHASE (content/shape), blending toward a permuted batch sample's amplitude.
+
+    Forces the CNN onto shape/phase, so OOD render textures (e.g. SimplerEnv) no
+    longer throw it off. Object positions are preserved (phase kept) → action
+    labels stay valid. Training-only; apply to the in-[0,1] frame batch before
+    per-image normalization. Validated: shrinks sim→real CNN-feature kNN gap
+    1.69→1.41 (apr_test.py), on par with AdaIN at zero cost.
+
+    frames : (B,3,H,W) float in [0,1].
+    p      : per-sample probability of applying APR.
+    eta_max: max fraction of the other sample's amplitude to mix in;
+             eta ~ U(0, eta_max). 1.0 allows a full amplitude swap.
+    """
+    B = frames.shape[0]
+    if B < 2 or p <= 0.0:
+        return frames
+    do = torch.rand(B, device=frames.device) < p
+    if not do.any():
+        return frames
+    fft = torch.fft.fft2(frames.float(), dim=(-2, -1))
+    amp, pha = fft.abs(), fft.angle()
+    perm = torch.randperm(B, device=frames.device)
+    eta = torch.empty(B, 1, 1, 1, device=frames.device).uniform_(0.0, eta_max)
+    amp_mix = (1.0 - eta) * amp + eta * amp[perm]
+    out = torch.fft.ifft2(amp_mix * torch.exp(1j * pha), dim=(-2, -1)).real.clamp(0, 1)
+    return torch.where(do.view(-1, 1, 1, 1), out, frames.float())
 
 
 # ════════════════════════════════════════════════════════════

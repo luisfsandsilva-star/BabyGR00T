@@ -152,6 +152,28 @@ def main():
     # Resume
     ap.add_argument('--resume', type=str, default=None,
                     help="Path to ckpt. Restores weights + optimizer + step + best_acc.")
+    ap.add_argument('--n-eps-cap', type=int, default=None,
+                    help="Cap episodes (debug/overfit sanity check). Limits both "
+                         "the dataset load and the cache indices used.")
+    # ρ revival (VQ-VAE dead-code-style) for the recursion decay rates
+    ap.add_argument('--revive', action='store_true',
+                    help="Revive a recursion rate (ρ_L/ρ_H) if it sigmoid-saturates "
+                         "near 0 (loop unused): reset to --revive-to and clear its "
+                         "optimizer momentum, giving the loop a fresh chance to "
+                         "prove useful as training/curriculum evolves.")
+    ap.add_argument('--revive-thresh', type=float, default=0.02)
+    ap.add_argument('--revive-patience', type=int, default=200,
+                    help="Consecutive optimizer-steps below thresh before reviving.")
+    ap.add_argument('--revive-to', type=float, default=0.1)
+    ap.add_argument('--revive-cooldown', type=int, default=400,
+                    help="Optimizer-steps to wait after a revival before re-checking.")
+    ap.add_argument('--revive-decay', type=float, default=1.0,
+                    help="Multiply the revive-to peak by this after each revival "
+                         "(<1 = annealed revival: if the loop keeps getting "
+                         "rejected the resurrections shrink and it dies off "
+                         "SMOOTHLY rather than oscillating; once the peak drops "
+                         "below --revive-thresh, reviving stops. 1.0 = constant "
+                         "peak, perpetual revival attempts).")
     args = ap.parse_args()
 
     torch.manual_seed(42); np.random.seed(42); random.seed(42)
@@ -202,16 +224,21 @@ def main():
             print(f"  cache contains {cache_n_episodes} episodes — capping "
                   f"dataset load to match.", flush=True)
 
+    cap = cache_n_episodes
+    if args.n_eps_cap is not None and (cap is None or args.n_eps_cap < cap):
+        cap = args.n_eps_cap
+        print(f"  --n-eps-cap: limiting to {cap} episodes (overfit/debug).", flush=True)
+
     print(f"Loading episodes ({args.dataset}, cached features) ...", flush=True)
     if args.dataset == 'oxe':
         episodes = load_lerobot_episodes(args.oxe_dataset_id,
                                           camera_key=args.oxe_camera,
                                           load_video=False,
-                                          n_episodes=cache_n_episodes)
+                                          n_episodes=cap)
     else:
         episodes = load_so101_episodes(load_video=False)
-        if cache_n_episodes:
-            episodes = episodes[:cache_n_episodes]
+    if cap:
+        episodes = episodes[:cap]
     inferred_state_dim = int(episodes[0][1].shape[-1])
     state_dim = args.state_dim if args.state_dim is not None else inferred_state_dim
     print(f"  state_dim = {state_dim}  (inferred {inferred_state_dim}; "
@@ -396,6 +423,9 @@ def main():
     signal.signal(signal.SIGINT, _save_on_exit)
     signal.signal(signal.SIGTERM, _save_on_exit)
 
+    revive_dead = {'L': 0, 'H': 0}   # consecutive steps a rate has been "dead"
+    revive_cd   = {'L': 0, 'H': 0}   # post-revival cooldown counters
+    revive_peak = {'L': args.revive_to, 'H': args.revive_to}  # annealed per-loop revive target
     loader_iter = iter(loader)
     while step < args.steps:
         try:
@@ -474,6 +504,37 @@ def main():
                 g['lr'] = args.lr * lr_scale
             amp_scaler.step(opt); amp_scaler.update()
             opt.zero_grad(set_to_none=True)
+
+            # ── ρ revival: if a loop's decay rate has sigmoid-saturated near 0
+            # (the recursion is unused), reset it to the high-gradient zone and
+            # clear its optimizer momentum so it gets a fresh chance to prove
+            # useful as the curriculum hardens. Both ρ_L and ρ_H.
+            if args.revive:
+                with torch.no_grad():
+                    for nm, raw in (('L', policy.rho_L_raw), ('H', policy.rho_H_raw)):
+                        if revive_cd[nm] > 0:
+                            revive_cd[nm] -= 1
+                            continue
+                        if torch.sigmoid(raw).item() < args.revive_thresh:
+                            revive_dead[nm] += 1
+                        else:
+                            revive_dead[nm] = 0
+                        if revive_dead[nm] >= args.revive_patience:
+                            rt = revive_peak[nm]
+                            if rt <= args.revive_thresh:
+                                # Annealed peak has shrunk below the dead-threshold:
+                                # the loop has been repeatedly rejected — let it stay
+                                # dead (smooth death), stop attempting to revive it.
+                                revive_dead[nm] = 0
+                                revive_cd[nm] = args.revive_cooldown
+                                continue
+                            raw.data.fill_(math.log(rt / (1 - rt)))
+                            opt.state.pop(raw, None)          # clear stale momentum
+                            revive_dead[nm] = 0
+                            revive_cd[nm] = args.revive_cooldown
+                            revive_peak[nm] = rt * args.revive_decay   # anneal next peak
+                            print(f"  [revive] ρ_{nm} dead → {rt:.3f} "
+                                  f"(next peak {revive_peak[nm]:.3f}) @ step {step}", flush=True)
 
         if step % args.log_every == 0 or step == 1:
             elapsed = time.perf_counter() - t0

@@ -34,6 +34,9 @@ def main():
     ap.add_argument('--batch-size', type=int, default=32)
     ap.add_argument('--ckpt-path', type=str, default='vqvae.pt')
     ap.add_argument('--log-every', type=int, default=200)
+    ap.add_argument('--norm-reg', choices=['eps', 'global'], default='global',
+                    help="precision regularizer: 'eps' (tiny, ~1/var, blows up on still chunks) "
+                         "or 'global' (Gamma-prior at global variance — bounded).")
     ap.add_argument('--action-dim', type=int, default=6,
                     help="Bridge=7, SO-101=6. Must match the dataset.")
     ap.add_argument('--dataset', choices=['so101', 'oxe'], default='so101')
@@ -54,8 +57,17 @@ def main():
         eps = load_so101_episodes(load_video=False)
         if args.n_eps_cap:
             eps = eps[:args.n_eps_cap]
-    actions = torch.cat([ep[0] for ep in eps], dim=0)               # (N, T, A)
-    print(f"  {len(actions)} chunks, action_dim={actions.shape[-1]}")
+    # pair each chunk with its PREVIOUS chunk (within episode) — RevIN lookback
+    cur_list, prev_list = [], []
+    for ep in eps:
+        ac = ep[0]                                                  # (n_ch, T, A)
+        if ac.shape[0] < 2:
+            continue
+        cur_list.append(ac[1:]); prev_list.append(ac[:-1])
+    actions = torch.cat(cur_list, dim=0); prevs = torch.cat(prev_list, dim=0)
+    var_global = actions.var(dim=(0, 1)).clamp(min=1e-8).to(device).view(1, 1, -1)  # per-dim global variance
+    print(f"  {len(actions)} (chunk, prev-chunk) pairs, action_dim={actions.shape[-1]}")
+    print(f"  global std (per-dim): {[round(x,4) for x in var_global.sqrt().flatten().tolist()]}  | norm-reg={args.norm_reg}")
 
     vae   = ActionVQVAE1d(action_dim=args.action_dim, vq_cls=VQ1d_EMA).to(device)
     revin = RevIN(args.action_dim).to(device)
@@ -65,7 +77,7 @@ def main():
 
     opt = torch.optim.AdamW(list(vae.parameters()) + list(revin.parameters()),
                             lr=args.lr, weight_decay=1e-4)
-    loader = DataLoader(TensorDataset(actions), batch_size=args.batch_size,
+    loader = DataLoader(TensorDataset(actions, prevs), batch_size=args.batch_size,
                         shuffle=True, drop_last=True)
     print(f"  {len(loader)} batches/epoch")
 
@@ -73,11 +85,20 @@ def main():
     t0 = time.perf_counter(); step = 0
     win_recon, win_vq, win_steps = 0.0, 0.0, 0
     while step < args.steps:
-        for (action,) in loader:
+        for (action, prev) in loader:
             if step >= args.steps:
                 break
             action = action.to(device, non_blocking=True)
-            x = revin(action, 'norm').transpose(1, 2)
+            prev = prev.to(device, non_blocking=True)
+            # RevIN-style, but compute PRECISION directly (Gamma-posterior mean) and MULTIPLY:
+            #   λ = n / (Σ(prev−m)² + reg)   — bounded since reg sits in the denominator.
+            # reg='eps' (tiny → ~1/var, blows up on still chunks) vs 'global' (n·var_global → prior at global precision).
+            n = action.shape[1]
+            m = prev.mean(dim=1, keepdim=True)
+            S = ((prev - m) ** 2).sum(dim=1, keepdim=True)
+            reg = 1e-6 if args.norm_reg == 'eps' else n * var_global
+            lam = n / (S + reg)                                  # precision (B,1,A)
+            x = ((action - m) * lam.sqrt()).transpose(1, 2)
             embs, vql, _ = vae.encode(x)
             recon = vae.decode(embs)
             recon_loss = F.mse_loss(recon, x)
@@ -95,6 +116,7 @@ def main():
     torch.save({'kind': 'vqvae',
                 'vae': vae.state_dict(), 'revin': revin.state_dict(),
                 'action_dim': args.action_dim,
+                'action_var_global': var_global.squeeze().cpu(), 'norm_reg': args.norm_reg,
                 'seq_lens': vae.seq_lens, 'k': vae.vq.K},
                args.ckpt_path)
     print(f"\nSaved {args.ckpt_path}")

@@ -52,7 +52,7 @@ else
     echo "=== STAGE 2/3: train VQ-VAE (action-dim 7, $VAE_STEPS steps) — $(date) ==="
     python -u -m scripts.train_vqvae \
         --dataset oxe --oxe-dataset-id "$DATASET_ID" --action-dim 7 \
-        --steps "$VAE_STEPS" --batch-size 32 --n-eps-cap "$N_EPS" \
+        --steps "$VAE_STEPS" --batch-size "${VAE_BATCH:-32}" --n-eps-cap "$N_EPS" \
         --ckpt-path "$VAE_CKPT"
 fi
 
